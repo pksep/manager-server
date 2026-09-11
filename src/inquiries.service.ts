@@ -74,7 +74,7 @@ export class InquiriesService implements OnModuleInit {
   ) {}
   async onModuleInit() {
     const version = await this.database.query(
-      'SELECT version FROM manager_schema_migrations WHERE version=1',
+      'SELECT version FROM manager_schema_migrations WHERE version=3',
     );
     if (!version.rowCount) throw new Error('Сначала примените миграции manager');
     for (const site of this.config.sites)

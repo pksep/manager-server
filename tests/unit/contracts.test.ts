@@ -1,6 +1,41 @@
 import { expect, test } from 'bun:test';
 import { SessionRequestSchema, SourceSchema } from '../../src/contracts';
 import { normalizeContacts } from '../../src/identity';
+import { readConfig } from '../../src/config';
+
+test('подключение ЕРП требует пару настроек и безопасный серверный адрес', () => {
+  const env = {
+    DATABASE_URL: 'postgresql://localhost/unused',
+    CHAT_SERVICE_URL: 'http://127.0.0.1:4501/api',
+    CHAT_MANAGER_KEY: 'c'.repeat(32),
+    MANAGER_INTERNAL_KEY: 'm'.repeat(32),
+  };
+  expect(readConfig(env).ERP_SERVICE_URL).toBeUndefined();
+  expect(() =>
+    readConfig({ ...env, ERP_SERVICE_URL: 'https://erp.example.test/api' }),
+  ).toThrow();
+  expect(() =>
+    readConfig({
+      ...env,
+      ERP_SERVICE_URL: 'http://erp.example.test/api',
+      ERP_MANAGER_KEY: 'e'.repeat(32),
+    }),
+  ).toThrow();
+  expect(() =>
+    readConfig({
+      ...env,
+      ERP_SERVICE_URL: 'https://user:password@erp.example.test/api',
+      ERP_MANAGER_KEY: 'e'.repeat(32),
+    }),
+  ).toThrow();
+  expect(
+    readConfig({
+      ...env,
+      ERP_SERVICE_URL: 'http://127.0.0.1:4502/api',
+      ERP_MANAGER_KEY: 'e'.repeat(32),
+    }).ERP_SERVICE_URL,
+  ).toBe('http://127.0.0.1:4502/api');
+});
 
 test('пустой referrer допустим, неверный URL возвращает ошибку проверки без исключения', () => {
   const source = {

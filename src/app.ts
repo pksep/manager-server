@@ -10,6 +10,7 @@ import { DeliveryWorker } from './delivery.worker';
 import { GuestGuard, HealthController, SafeErrorFilter, WidgetController } from './http';
 import { attachWidgetEvents } from './widget-events';
 import { StaffController, StaffGuard } from './staff';
+import { ErpSyncService } from './erp-sync.service';
 
 export async function createApplication(config: Config) {
   @Module({
@@ -22,6 +23,7 @@ export async function createApplication(config: Config) {
       DeliveryWorker,
       GuestGuard,
       StaffGuard,
+      ErpSyncService,
     ],
   })
   class ManagerModule {}

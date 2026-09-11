@@ -35,18 +35,29 @@ export class Database implements OnModuleDestroy {
   }
   /** Применяет миграции только базы сервиса обращений под общей блокировкой. */
   async migrate() {
-    const sql = await readFile('migrations/001_initial.sql', 'utf8');
     await this.transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtext('manager:migrations'))");
       await client.query(
         'CREATE TABLE IF NOT EXISTS manager_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())',
       );
-      const result = await client.query(
-        'SELECT version FROM manager_schema_migrations WHERE version=1',
-      );
-      if (!result.rowCount) {
-        await client.query(sql);
-        await client.query('INSERT INTO manager_schema_migrations(version) VALUES (1)');
+      const migrations = [
+        '001_initial.sql',
+        '002_erp_sync.sql',
+        '003_customer_history.sql',
+      ];
+      for (const [index, file] of migrations.entries()) {
+        const version = index + 1;
+        const result = await client.query(
+          'SELECT version FROM manager_schema_migrations WHERE version=$1',
+          [version],
+        );
+        if (!result.rowCount) {
+          await client.query(await readFile(`migrations/${file}`, 'utf8'));
+          await client.query(
+            'INSERT INTO manager_schema_migrations(version) VALUES ($1)',
+            [version],
+          );
+        }
       }
     });
   }

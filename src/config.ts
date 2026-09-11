@@ -17,6 +17,12 @@ const settingsSchema = z.object({
     .min(32)
     .refine((value) => !value.startsWith('REPLACE_')),
   CHAT_SERVICE_URL: z.url(),
+  ERP_SERVICE_URL: z.url().optional(),
+  ERP_MANAGER_KEY: z
+    .string()
+    .min(32)
+    .refine((value) => !value.startsWith('REPLACE_'))
+    .optional(),
   MANAGER_SITES_PATH: z.string().default('config/sites.example.json'),
   MANAGER_QUEUE_LIMIT: z.coerce.number().int().positive().default(10000),
   MANAGER_SESSION_HOURS: z.coerce.number().int().min(1).max(720).default(24),
@@ -29,6 +35,23 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
       `Проверьте настройки: ${[...new Set(parsed.error.issues.map((issue) => issue.path[0]))].join(', ')}`,
     );
   const settings = parsed.data;
+  if (!!settings.ERP_SERVICE_URL !== !!settings.ERP_MANAGER_KEY)
+    throw new Error('Укажите ERP_SERVICE_URL и ERP_MANAGER_KEY вместе');
+  if (settings.ERP_SERVICE_URL) {
+    const url = new URL(settings.ERP_SERVICE_URL);
+    if (
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !(
+        url.protocol === 'https:' ||
+        (url.protocol === 'http:' &&
+          ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
+      )
+    )
+      throw new Error('ERP_SERVICE_URL должен использовать HTTPS либо loopback');
+  }
   const chatUrl = new URL(settings.CHAT_SERVICE_URL);
   if (
     chatUrl.username ||

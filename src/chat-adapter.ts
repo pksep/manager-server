@@ -1,4 +1,9 @@
-import { Inject, Injectable, ServiceUnavailableException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Inject,
+  Injectable,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { z } from 'zod';
 import { CONFIG, type Config } from './config';
 import {
@@ -13,6 +18,17 @@ export class ChatAdapter {
   /** Проверяет право сотрудника по тому же источнику, что использует СЭП Чат. */
   async assertManager(id: string) {
     await this.request(`/managers/${encodeURIComponent(id)}/access`);
+  }
+  /** Связь с ЕРП выдаёт доверенный поставщик прав, а не редактируемый профиль. */
+  async erpActor(id: string): Promise<number> {
+    const grant = z
+      .object({
+        allowed: z.literal(true),
+        erpUserId: z.number().int().positive().nullable(),
+      })
+      .parse(await (await this.request(`/managers/${id}/access`)).json());
+    if (!grant.erpUserId) throw new ForbiddenException('Учётная запись не связана с ЕРП');
+    return grant.erpUserId;
   }
   constructor(@Inject(CONFIG) private readonly config: Config) {}
   /** Все обращения к чату остаются серверными; гостевой токен здесь не используется. */
