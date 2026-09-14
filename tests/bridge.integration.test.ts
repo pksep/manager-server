@@ -218,6 +218,7 @@ beforeAll(async () => {
 }, 60000);
 afterAll(async () => {
   sockets.forEach((socket) => socket.terminate());
+  runtime?.app.getHttpServer().closeAllConnections();
   await runtime?.close();
   await db.end();
   await chatDb.end();
@@ -309,6 +310,18 @@ test('пять одновременных отправок создают одн
 }, 25000);
 
 test('ответы и прочтения приходят по WebSocket, первый ответственный сохраняется', async () => {
+  const beforeReply = (await staffDetail()).inquiry;
+  await request(
+    chatBase + `/manager/inquiries/${inquiryId}/metadata`,
+    json(
+      {
+        version: beforeReply.metadata_version,
+        note: 'Внутренняя заметка до первого ответа',
+      },
+      staffHeaders(),
+    ),
+    201,
+  );
   const live = await connect();
   expect(
     live.frames[0].messages.some((message: any) => message.id === guestMessageId),
@@ -326,6 +339,7 @@ test('ответы и прочтения приходят по WebSocket, пер
         .length === 2,
   );
   expect((await staffDetail()).inquiry.assignee_id).toBe(alice.id);
+  expect((await staffDetail()).inquiry.manager_ids).toEqual([alice.id]);
   const receipt = await delivered(inquiryId);
   await request(
     chatBase + `/messages/topic/${topicId}/read`,
@@ -450,19 +464,55 @@ test('файлы проходят в обе стороны через S3 чат�
   );
 }, 30000);
 
-test('новый посетитель с теми же контактами не получает старую историю, совпадение доступно менеджеру', async () => {
+test('те же телефон и email продолжают один чат, а история остаётся разделённой по сессиям', async () => {
   const newGuest = await session();
   expect(newGuest.messages).toEqual([]);
-  const created = await sendGuest(newGuest.token, 'Новое обращение с теми же контактами');
-  await delivered(created.inquiryId);
-  const detail = await staffDetail(created.inquiryId);
   const originalDetail = await staffDetail();
-  expect(
-    detail.contactCandidates.some(
-      (candidate: any) => candidate.id === originalDetail.inquiry.customer_id,
-    ),
-  ).toBe(true);
-  expect(detail.inquiry.customer_id).not.toBe(originalDetail.inquiry.customer_id);
+  const form = new FormData();
+  form.set('operationId', randomUUID());
+  form.set(
+    'file',
+    new Blob(['Файл новой сессии'], { type: 'text/plain' }),
+    'repeat-session.txt',
+  );
+  const attachment = (await (
+    await request(
+      base + '/v1/widget/attachments',
+      {
+        method: 'POST',
+        headers: guestHeaders(newGuest.token),
+        body: form,
+      },
+      201,
+    )
+  ).json()) as any;
+  const created = await sendGuest(
+    newGuest.token,
+    'Новое обращение с теми же контактами',
+    undefined,
+    [attachment.id],
+  );
+  expect(created.inquiryId).toBe(inquiryId);
+  await until(
+    () =>
+      db.query('SELECT state FROM delivery_operations WHERE id=$1', [created.message.id]),
+    (result) => result.rows[0]?.state === 'delivered',
+  );
+  const detail = await staffDetail(created.inquiryId);
+  expect(detail.inquiry.customer_id).toBe(originalDetail.inquiry.customer_id);
+  expect(detail.inquiry.topic_id).toBe(topicId);
+  expect(detail.inquiry.manager_ids).toEqual(originalDetail.inquiry.manager_ids);
+  expect(detail.inquiry.note).toBe(originalDetail.inquiry.note);
+  await request(
+    base + '/v1/widget/attachments/' + attachment.id,
+    { headers: guestHeaders(newGuest.token) },
+    200,
+  );
+  await request(
+    base + '/v1/widget/attachments/' + attachment.id,
+    { headers: guestHeaders() },
+    404,
+  );
   await request(
     chatBase + `/manager/inquiries/${created.inquiryId}/assignee`,
     json({ userId: bob.id }, staffHeaders()),
@@ -471,7 +521,7 @@ test('новый посетитель с теми же контактами не
   await reply('Первый ответ после ручного выбора', alice, [], created.inquiryId);
   await until(
     () => staffDetail(created.inquiryId),
-    (value) => value.messages.length === 2,
+    (value) => value.messages.length === detail.messages.length + 1,
   );
   expect((await staffDetail(created.inquiryId)).inquiry.assignee_id).toBe(bob.id);
   const snapshot = (await (
@@ -487,9 +537,98 @@ test('новый посетитель с теми же контактами не
       201,
     )
   ).json()) as any;
+  expect(snapshot.messages.map((message: any) => message.html)).toEqual([
+    'Новое обращение с теми же контактами',
+    'Первый ответ после ручного выбора',
+  ]);
+  const stream = await connect(newGuest.token);
+  expect(stream.frames.find((frame) => frame.type === 'ready').messages).toEqual(
+    snapshot.messages,
+  );
+  stream.socket.terminate();
+  const previousHistory = (await (
+    await request(
+      base + `/v1/widget/inquiries/${inquiryId}/messages`,
+      { headers: guestHeaders() },
+      200,
+    )
+  ).json()) as any;
   expect(
-    snapshot.messages.every((message: any) => message.inquiryId === created.inquiryId),
-  ).toBe(true);
+    previousHistory.messages.some((message: any) => message.id === created.message.id),
+  ).toBe(false);
+  expect(
+    previousHistory.messages.some(
+      (message: any) => message.html === 'Первый ответ после ручного выбора',
+    ),
+  ).toBe(false);
+}, 30000);
+
+test('параллельные сессии с нормализованными контактами не создают дубль, одинаковые ключи отправки независимы', async () => {
+  const guests = await Promise.all([session(), session()]);
+  const operationId = randomUUID();
+  const results = await Promise.all(
+    guests.map(
+      async (session, index) =>
+        (
+          await request(
+            base + '/v1/widget/inquiries',
+            json(
+              {
+                operationId,
+                html: `Параллельная сессия ${index}`,
+                attachmentIds: [],
+                contacts: {
+                  ...contacts,
+                  phone: contacts.phone.replace(/(\d{3})/, '$1 '),
+                  email: contacts.email.toUpperCase(),
+                },
+              },
+              guestHeaders(session.token),
+            ),
+            201,
+          )
+        ).json() as Promise<any>,
+    ),
+  );
+  expect(new Set(results.map((row) => row.inquiryId))).toEqual(new Set([inquiryId]));
+  expect(new Set(results.map((row) => row.message.id)).size).toBe(2);
+  for (let index = 0; index < guests.length; index++) {
+    const history = (await (
+      await request(
+        base + `/v1/widget/inquiries/${inquiryId}/messages`,
+        { headers: guestHeaders(guests[index].token) },
+        200,
+      )
+    ).json()) as any;
+    expect(history.messages.map((message: any) => message.html)).toEqual([
+      `Параллельная сессия ${index}`,
+    ]);
+  }
+  const stranger = await session();
+  const different = (await (
+    await request(
+      base + '/v1/widget/inquiries',
+      json(
+        {
+          operationId: randomUUID(),
+          html: 'Другой email',
+          attachmentIds: [],
+          contacts: { ...contacts, email: `other-${randomUUID()}@example.test` },
+        },
+        guestHeaders(stranger.token),
+      ),
+      201,
+    )
+  ).json()) as any;
+  expect(different.inquiryId).not.toBe(inquiryId);
+  await until(
+    () =>
+      db.query(
+        "SELECT id FROM delivery_operations WHERE id=ANY($1::uuid[]) AND state<>'delivered'",
+        [[...results.map((row) => row.message.id), different.message.id]],
+      ),
+    (result) => result.rowCount === 0,
+  );
 }, 30000);
 
 test('потеря подтверждения и перезапуск сервиса не дублируют сообщение в чате', async () => {
@@ -517,6 +656,7 @@ test('потеря подтверждения и перезапуск серви
     (result) =>
       lost && result.rows[0]?.state === 'pending' && result.rows[0]?.attempts === 1,
   );
+  runtime.app.getHttpServer().closeAllConnections();
   await runtime.close();
   await start();
   await until(
@@ -539,7 +679,122 @@ test('потеря подтверждения и перезапуск серви
   live.socket.terminate();
 }, 30000);
 
+test('карточка хранит нескольких менеджеров и примечание, отклоняет устаревшие версии и посторонних', async () => {
+  expect(
+    await (
+      await request(chatBase + '/manager/access', { headers: staffHeaders() }, 200)
+    ).json(),
+  ).toEqual({ allowed: true });
+  expect(
+    await (
+      await request(
+        chatBase + '/manager/access',
+        { headers: staffHeaders(outsider) },
+        200,
+      )
+    ).json(),
+  ).toEqual({ allowed: false });
+  const people = (await (
+    await request(chatBase + '/manager/managers', { headers: staffHeaders() }, 200)
+  ).json()) as any[];
+  expect(people.map((person) => person.id).sort()).toEqual([alice.id, bob.id].sort());
+  const item = (await staffDetail()).inquiry;
+  expect(item.guest_user_id).toBeTruthy();
+  const endpoint = chatBase + `/manager/inquiries/${inquiryId}/metadata`;
+  await request(
+    endpoint,
+    json(
+      { version: item.metadata_version, managerIds: [alice.id, outsider.id] },
+      staffHeaders(),
+    ),
+    400,
+  );
+  await request(
+    endpoint,
+    json(
+      { version: item.metadata_version, managerIds: [alice.id, alice.id] },
+      staffHeaders(),
+    ),
+    400,
+  );
+  await request(
+    endpoint,
+    json({ version: item.metadata_version, note: 'x'.repeat(10001) }, staffHeaders()),
+    400,
+  );
+  const updated = (await (
+    await request(
+      endpoint,
+      json(
+        {
+          version: item.metadata_version,
+          managerIds: [alice.id, bob.id],
+          note: 'Позвонить после согласования',
+        },
+        staffHeaders(),
+      ),
+      201,
+    )
+  ).json()) as any;
+  expect(updated.managerIds).toEqual([alice.id, bob.id]);
+  expect(updated.assigneeId).toBe(bob.id);
+  const simultaneous = await Promise.all(
+    ['А', 'Б'].map((note) =>
+      request(endpoint, json({ version: updated.version, note }, staffHeaders())),
+    ),
+  );
+  expect(simultaneous.map((response) => response.status).sort()).toEqual([201, 409]);
+  const current = (await staffDetail()).inquiry;
+  expect(['А', 'Б']).toContain(current.note);
+  expect(current.metadata_version).toBe(updated.version + 1);
+  await reply('<p>Ответ сохраняет всех выбранных менеджеров</p>');
+  await until(
+    () => staffDetail(),
+    (detail) =>
+      detail.messages.some((message: any) => message.html?.includes('всех выбранных')),
+  );
+  expect((await staffDetail()).inquiry.manager_ids).toEqual([alice.id, bob.id]);
+  await request(
+    endpoint,
+    json({ version: current.metadata_version, managerIds: [] }, staffHeaders()),
+    201,
+  );
+  await reply('<p>Ответ после снятия менеджеров</p>', bob);
+  await until(
+    () => staffDetail(),
+    (detail) =>
+      detail.messages.some((message: any) => message.html?.includes('снятия менеджеров')),
+  );
+  expect((await staffDetail()).inquiry.manager_ids).toEqual([]);
+  expect((await staffDetail()).inquiry.assignee_id).toBeNull();
+  await request(
+    endpoint,
+    json(
+      { version: current.metadata_version + 1, note: 'Чужая правка' },
+      staffHeaders(outsider),
+    ),
+    403,
+  );
+}, 30000);
+
 test('право раздела обязательно; отзыв закрывает историю, файлы и ответы', async () => {
+  await grants([alice.id]);
+  await request(
+    chatBase + `/manager/inquiries/${inquiryId}`,
+    { headers: staffHeaders(bob) },
+    403,
+  );
+  await grants([alice.id, bob.id]);
+  await request(
+    chatBase + `/manager/inquiries/${inquiryId}`,
+    { headers: staffHeaders(bob) },
+    200,
+  );
+  const restored = await chatDb.query(
+    'SELECT count(*)::int AS count FROM topic_settings WHERE topic_id=$1 AND user_id=$2 AND "deletedAt" IS NULL',
+    [topicId, bob.id],
+  );
+  expect(restored.rows[0].count).toBe(1);
   await request(
     chatBase + '/manager/inquiries',
     { headers: staffHeaders(outsider) },

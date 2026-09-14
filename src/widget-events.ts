@@ -66,15 +66,16 @@ export function attachWidgetEvents(server: Server, inquiries: InquiriesService) 
                   [guest.id],
                 );
                 const inquiry = (
-                  await client.query('SELECT id FROM inquiries WHERE session_id=$1', [
-                    guest.id,
-                  ])
+                  await client.query(
+                    'SELECT inquiry_id AS id FROM guest_sessions WHERE id=$1 AND inquiry_id IS NOT NULL',
+                    [guest.id],
+                  )
                 ).rows[0];
                 const messages = inquiry
                   ? (
                       await client.query(
-                        'SELECT * FROM (SELECT * FROM messages WHERE inquiry_id=$1 ORDER BY sequence DESC LIMIT 500) history ORDER BY sequence',
-                        [inquiry.id],
+                        'SELECT * FROM (SELECT * FROM messages WHERE inquiry_id=$1 AND session_id=$2 ORDER BY sequence DESC LIMIT 500) history ORDER BY sequence',
+                        [inquiry.id, guest.id],
                       )
                     ).rows.map(presentMessage)
                   : [];

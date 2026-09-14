@@ -14,6 +14,8 @@
     "test:integration": "bun run build && bun --env-file=.env.local test tests/bridge.integration.test.ts --timeout 30000",
     "test:erp": "bun run build && bun --env-file=.env.local test tests/erp.integration.test.ts --timeout 30000",
     "test:browser": "bun run build && node --env-file=.env.local scripts/verify-widget.mts",
+    "test:clients": "node scripts/verify-clients.mjs",
+    "test:erp:ui": "node scripts/verify-erp-ui.mjs",
     "local:setup": "bun scripts/local-setup.ts",
     "local:infra": "docker compose --env-file .env.local -f compose.local.yml up -d --wait",
     "local:chat": "bun scripts/chat-local-setup.ts",

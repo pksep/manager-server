@@ -24,7 +24,7 @@ import {
   type Site,
   type ChatEvent,
 } from './contracts';
-import { normalizeContacts } from './identity';
+import { normalizeContacts, resolveCustomer } from './identity';
 import { multipartFilename } from './filename';
 
 export const hash = (value: string | Buffer) =>
@@ -39,6 +39,7 @@ export interface Guest {
 type MessageRow = {
   id: string;
   inquiry_id: string;
+  session_id: string;
   direction: 'incoming' | 'outgoing';
   author: string;
   avatar_url?: string;
@@ -74,7 +75,7 @@ export class InquiriesService implements OnModuleInit {
   ) {}
   async onModuleInit() {
     const version = await this.database.query(
-      'SELECT version FROM manager_schema_migrations WHERE version=3',
+      'SELECT version FROM manager_schema_migrations WHERE version=5',
     );
     if (!version.rowCount) throw new Error('Сначала примените миграции manager');
     for (const site of this.config.sites)
@@ -172,27 +173,27 @@ export class InquiriesService implements OnModuleInit {
   async snapshot(guest: Guest) {
     const inquiry = (
       await this.database.query<{ id: string }>(
-        'SELECT id FROM inquiries WHERE session_id=$1',
+        'SELECT inquiry_id AS id FROM guest_sessions WHERE id=$1 AND inquiry_id IS NOT NULL',
         [guest.id],
       )
     ).rows[0];
     if (!inquiry) return { inquiryId: null, messages: [] as WidgetMessage[] };
     const result = await this.database.query<MessageRow>(
-      `SELECT ${messageFields} FROM (SELECT * FROM messages WHERE inquiry_id=$1 ORDER BY sequence DESC LIMIT 500) current_messages ORDER BY sequence`,
-      [inquiry.id],
+      `SELECT ${messageFields} FROM (SELECT * FROM messages WHERE inquiry_id=$1 AND session_id=$2 ORDER BY sequence DESC LIMIT 500) current_messages ORDER BY sequence`,
+      [inquiry.id, guest.id],
     );
     return { inquiryId: inquiry.id, messages: result.rows.map(presentMessage) };
   }
   async history(guest: Guest, inquiryId: string, after: string) {
     if (!/^\d{1,18}$/.test(after)) throw new BadRequestException('Некорректный курсор');
     const inquiry = await this.database.query(
-      'SELECT id FROM inquiries WHERE id=$1 AND session_id=$2',
+      'SELECT i.id FROM guest_sessions g JOIN inquiries i ON i.id=g.inquiry_id WHERE g.id=$2 AND (i.id=$1 OR EXISTS(SELECT 1 FROM inquiries old WHERE old.id=$1 AND old.merged_into=i.id))',
       [inquiryId, guest.id],
     );
     if (!inquiry.rowCount) throw new NotFoundException('Обращение не найдено');
     const result = await this.database.query<MessageRow & { sequence: string }>(
-      `SELECT ${messageFields},sequence FROM messages WHERE inquiry_id=$1 AND sequence>$2 ORDER BY sequence LIMIT 100`,
-      [inquiryId, after],
+      `SELECT ${messageFields},sequence FROM messages WHERE inquiry_id=$1 AND session_id=$3 AND sequence>$2 ORDER BY sequence LIMIT 100`,
+      [inquiry.rows[0].id, after, guest.id],
     );
     return {
       messages: result.rows.map(presentMessage),
@@ -246,17 +247,25 @@ export class InquiriesService implements OnModuleInit {
         guest.id,
       ]);
       let inquiry = (
-        await client.query('SELECT * FROM inquiries WHERE session_id=$1 FOR UPDATE', [
-          guest.id,
-        ])
+        await client.query(
+          'SELECT i.* FROM inquiries i JOIN guest_sessions g ON g.inquiry_id=i.id WHERE g.id=$1 FOR UPDATE OF i',
+          [guest.id],
+        )
       ).rows[0];
-      if (inquiryId && inquiry?.id !== inquiryId)
-        throw new NotFoundException('Обращение не найдено');
+      if (inquiryId && inquiry?.id !== inquiryId) {
+        const alias =
+          inquiry &&
+          (await client.query('SELECT id FROM inquiries WHERE id=$1 AND merged_into=$2', [
+            inquiryId,
+            inquiry.id,
+          ]));
+        if (!alias?.rowCount) throw new NotFoundException('Обращение не найдено');
+      }
       if (inquiry) {
         const existing = (
           await client.query(
-            'SELECT * FROM messages WHERE inquiry_id=$1 AND operation_id=$2',
-            [inquiry.id, input.operationId],
+            'SELECT * FROM messages WHERE session_id=$1 AND operation_id=$2',
+            [guest.id, input.operationId],
           )
         ).rows[0];
         if (existing) {
@@ -294,13 +303,7 @@ export class InquiriesService implements OnModuleInit {
       if (!inquiry) {
         if (!input.contacts || !normalized)
           throw new BadRequestException('Оставьте контакты');
-        const customerId = randomUUID(),
-          id = randomUUID();
-        await client.query('INSERT INTO customers(id,name,contacts) VALUES($1,$2,$3)', [
-          customerId,
-          input.contacts.name,
-          input.contacts,
-        ]);
+        const customerId = await resolveCustomer(client, input.contacts, normalized);
         for (const [kind, value] of Object.entries({
           session: guest.id,
           ...normalized,
@@ -312,11 +315,26 @@ export class InquiriesService implements OnModuleInit {
             );
         inquiry = (
           await client.query(
-            'INSERT INTO inquiries(id,session_id,site_id,customer_id,source) VALUES($1,$2,$3,$4,$5) RETURNING *',
-            [id, guest.id, site.id, customerId, guest.source],
+            "SELECT * FROM inquiries WHERE customer_id=$1 AND status='OPEN' AND merged_into IS NULL FOR UPDATE",
+            [customerId],
           )
         ).rows[0];
+        if (!inquiry)
+          inquiry = (
+            await client.query(
+              'INSERT INTO inquiries(id,session_id,site_id,customer_id,source) VALUES($1,$2,$3,$4,$5) RETURNING *',
+              [randomUUID(), guest.id, site.id, customerId, guest.source],
+            )
+          ).rows[0];
+        await client.query('UPDATE guest_sessions SET inquiry_id=$2 WHERE id=$1', [
+          guest.id,
+          inquiry.id,
+        ]);
       }
+      await client.query('UPDATE inquiries SET source=$2 WHERE id=$1', [
+        inquiry.id,
+        guest.source,
+      ]);
       const author = (
         await client.query<{ name: string }>('SELECT name FROM customers WHERE id=$1', [
           inquiry.customer_id,
@@ -334,7 +352,7 @@ export class InquiriesService implements OnModuleInit {
       const id = randomUUID();
       const message = (
         await client.query<MessageRow>(
-          "INSERT INTO messages(id,inquiry_id,operation_id,fingerprint,direction,author,html,attachments) VALUES($1,$2,$3,$4,'outgoing',$5,$6,$7) RETURNING *",
+          "INSERT INTO messages(id,inquiry_id,operation_id,fingerprint,direction,author,html,attachments,session_id) VALUES($1,$2,$3,$4,'outgoing',$5,$6,$7,$8) RETURNING *",
           [
             id,
             inquiry.id,
@@ -343,6 +361,7 @@ export class InquiriesService implements OnModuleInit {
             author,
             html,
             JSON.stringify(attachments),
+            guest.id,
           ],
         )
       ).rows[0];
@@ -466,13 +485,21 @@ export class InquiriesService implements OnModuleInit {
         if (event.sequence <= cursor) continue;
         if (event.sequence !== cursor + 1)
           throw new ConflictException('Пропуск в событиях чата');
+        const recipient = await client.query(
+          'SELECT id FROM guest_sessions WHERE id=$1 AND inquiry_id=$2',
+          [event.guestSessionId, inquiryId],
+        );
+        if (!recipient.rowCount)
+          throw new ConflictException('Сессия события не связана с обращением');
         let messageId: string | undefined;
+        let sessionId = event.guestSessionId;
         if (event.direction === 'outgoing') {
           const updated = await client.query(
-            'UPDATE messages SET chat_message_id=$1,read_at=COALESCE(read_at,$2) WHERE inquiry_id=$3 AND (chat_message_id=$1 OR id=$4) RETURNING id',
+            'UPDATE messages SET chat_message_id=$1,read_at=COALESCE(read_at,$2) WHERE inquiry_id=$3 AND (chat_message_id=$1 OR id=$4) RETURNING id,session_id',
             [event.messageId, event.readAt ?? null, inquiryId, event.operationId ?? null],
           );
           messageId = updated.rows[0]?.id;
+          sessionId = updated.rows[0]?.session_id || sessionId;
         } else if (event.type === 'message') {
           messageId = event.messageId;
           for (const file of event.attachments)
@@ -480,7 +507,7 @@ export class InquiriesService implements OnModuleInit {
               'INSERT INTO attachments(id,session_id,operation_id,fingerprint,name,size,mime,chat_id,inquiry_id) VALUES($1,$2,$3,$4,$5,$6,$7,$1,$8) ON CONFLICT(id) DO NOTHING',
               [
                 file.id,
-                header.session_id,
+                sessionId,
                 `chat:${file.id}`,
                 'chat',
                 file.name,
@@ -490,7 +517,7 @@ export class InquiriesService implements OnModuleInit {
               ],
             );
           await client.query(
-            "INSERT INTO messages(id,inquiry_id,direction,author,actor_id,avatar_url,html,attachments,chat_message_id,created_at) VALUES($1,$2,'incoming',$3,$4,$5,$6,$7,$1,$8) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO messages(id,inquiry_id,direction,author,actor_id,avatar_url,html,attachments,chat_message_id,created_at,session_id) VALUES($1,$2,'incoming',$3,$4,$5,$6,$7,$1,$8,$9) ON CONFLICT(id) DO NOTHING",
             [
               messageId,
               inquiryId,
@@ -500,10 +527,11 @@ export class InquiriesService implements OnModuleInit {
               event.html,
               JSON.stringify(event.attachments),
               event.createdAt,
+              sessionId,
             ],
           );
           const assigned = await client.query(
-            'UPDATE inquiries SET assignee_id=$2 WHERE id=$1 AND assignee_id IS NULL AND NOT manually_assigned RETURNING id',
+            'UPDATE inquiries SET assignee_id=$2,manager_ids=ARRAY[$2::uuid],metadata_version=metadata_version+1 WHERE id=$1 AND assignee_id IS NULL AND NOT manually_assigned RETURNING id',
             [inquiryId, event.senderId],
           );
           if (assigned.rowCount)
@@ -512,7 +540,7 @@ export class InquiriesService implements OnModuleInit {
               [randomUUID(), inquiryId, event.senderId],
             );
         }
-        if (messageId) await this.publish(client, header.session_id, messageId);
+        if (messageId) await this.publish(client, sessionId, messageId);
         cursor = event.sequence;
       }
       await client.query('UPDATE inquiries SET chat_cursor=$2 WHERE id=$1', [

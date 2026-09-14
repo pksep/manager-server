@@ -1,8 +1,11 @@
 import {
   Body,
+  BadRequestException,
   CanActivate,
   Controller,
+  ConflictException,
   ExecutionContext,
+  ForbiddenException,
   Get,
   Inject,
   Injectable,
@@ -73,11 +76,15 @@ export class StaffController {
 
   /** Все сотрудники с правом раздела видят общий список обращений и источник каждого. */
   @Get('inquiries')
-  async list() {
+  async list(@Query('page') rawPage = '1') {
+    const page = z.coerce.number().int().min(1).max(100000).parse(rawPage);
     return (
-      await this.inquiries.database.query(`SELECT i.*,c.name,c.contacts,c.erp_contact_id,
+      await this.inquiries.database.query(
+        `SELECT i.*,c.name,c.contacts,c.erp_contact_id,
       (SELECT count(*)::int FROM delivery_operations d WHERE d.inquiry_id=i.id AND d.state='failed') AS failed_deliveries
-      FROM inquiries i JOIN customers c ON c.id=i.customer_id ORDER BY i.created_at DESC LIMIT 100`)
+      FROM inquiries i JOIN customers c ON c.id=i.customer_id WHERE i.merged_into IS NULL ORDER BY i.created_at DESC,i.id DESC LIMIT 100 OFFSET $1`,
+        [(page - 1) * 100],
+      )
     ).rows;
   }
 
@@ -112,7 +119,7 @@ export class StaffController {
     return { inquiry, messages, contactCandidates: candidates, erpOperations };
   }
 
-  /** Предыдущие обращения доступны менеджерам после явной связи с одним контактом ЕРП. */
+  /** Менеджеры видят историю клиента и обращений, связанных с его контактом ЕРП. */
   @Get('inquiries/:id/history')
   async history(@Param('id', ParseUUIDPipe) id: string, @Query('after') after = '0') {
     const cursor = z
@@ -150,23 +157,97 @@ export class StaffController {
     @Req() request: StaffRequest,
   ) {
     const { userId } = z.object({ userId: z.uuid() }).strict().parse(body);
-    if (userId) await this.inquiries.chat.assertManager(userId);
+    await this.applyMetadata(id, { managerIds: [userId] }, request.actorId);
+    return { inquiryId: id, assigneeId: userId, manuallyAssigned: true };
+  }
+
+  /** Сохраняет множественное назначение и внутреннее примечание без потери параллельных правок. */
+  @Post('inquiries/:id/metadata')
+  metadata(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: unknown,
+    @Req() request: StaffRequest,
+  ) {
+    const input = z
+      .object({
+        version: z.number().int().nonnegative(),
+        managerIds: z
+          .array(z.uuid())
+          .max(20)
+          .refine((ids) => new Set(ids).size === ids.length)
+          .optional(),
+        note: z.string().max(10000).optional(),
+      })
+      .strict()
+      .refine((value) => value.managerIds !== undefined || value.note !== undefined)
+      .parse(body);
+    return this.applyMetadata(id, input, request.actorId);
+  }
+
+  /** Общая операция для прежнего одиночного назначения и новой карточки клиента. */
+  private async applyMetadata(
+    id: string,
+    input: { version?: number; managerIds?: string[]; note?: string },
+    actorId: string,
+  ) {
+    for (const userId of input.managerIds || []) {
+      try {
+        await this.inquiries.chat.assertManager(userId);
+      } catch (error) {
+        if (error instanceof ForbiddenException)
+          throw new BadRequestException(
+            'Выбранный менеджер больше не имеет доступа к разделу',
+          );
+        throw error;
+      }
+    }
     return this.inquiries.database.transaction(async (client) => {
       const inquiry = (
         await client.query('SELECT * FROM inquiries WHERE id=$1 FOR UPDATE', [id])
       ).rows[0];
       if (!inquiry) throw new NotFoundException('Обращение не найдено');
-      if (inquiry.assignee_id !== userId || !inquiry.manually_assigned) {
-        await client.query(
-          'UPDATE inquiries SET assignee_id=$2,manually_assigned=true WHERE id=$1',
-          [id, userId],
+      if (input.version !== undefined && input.version !== inquiry.metadata_version)
+        throw new ConflictException(
+          'Карточка уже изменена другим менеджером. Обновите данные и повторите изменение.',
         );
+      const managerIds = input.managerIds ?? inquiry.manager_ids;
+      const note = input.note ?? inquiry.note;
+      const assigneeId = managerIds.includes(inquiry.assignee_id)
+        ? inquiry.assignee_id
+        : (managerIds[0] ?? null);
+      const updated = (
+        await client.query(
+          'UPDATE inquiries SET manager_ids=$2,assignee_id=$3,note=$4,metadata_version=metadata_version+1,manually_assigned=manually_assigned OR $5 WHERE id=$1 RETURNING *',
+          [id, managerIds, assigneeId, note, input.managerIds !== undefined],
+        )
+      ).rows[0];
+      if (
+        input.managerIds !== undefined &&
+        assigneeId &&
+        (inquiry.assignee_id !== assigneeId || !inquiry.manually_assigned)
+      ) {
         await client.query(
           'INSERT INTO assignment_events(id,inquiry_id,previous_user_id,user_id,actor_id,reason) VALUES($1,$2,$3,$4,$5,$6)',
-          [randomUUID(), id, inquiry.assignee_id, userId, request.actorId, 'manual'],
+          [randomUUID(), id, inquiry.assignee_id, assigneeId, actorId, 'manual'],
         );
       }
-      return { inquiryId: id, assigneeId: userId, manuallyAssigned: true };
+      await client.query(
+        'INSERT INTO inquiry_metadata_events(id,inquiry_id,actor_id,previous_value,value) VALUES($1,$2,$3,$4,$5)',
+        [
+          randomUUID(),
+          id,
+          actorId,
+          JSON.stringify({ managerIds: inquiry.manager_ids, note: inquiry.note }),
+          JSON.stringify({ managerIds, note }),
+        ],
+      );
+      return {
+        inquiryId: id,
+        managerIds: updated.manager_ids,
+        note: updated.note,
+        version: updated.metadata_version,
+        assigneeId: updated.assignee_id,
+      };
     });
   }
 

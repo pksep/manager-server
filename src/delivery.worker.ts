@@ -64,11 +64,19 @@ export class DeliveryWorker implements OnModuleInit, OnModuleDestroy {
         ).rows[0];
         const message = (await db.query('SELECT * FROM messages WHERE id=$1', [job.id]))
           .rows[0];
-        const receipt = await this.inquiries.chat.deliver(inquiry as any, {
-          id: message.id,
-          html: message.html,
-          attachmentIds: message.attachments.map((file: { id: string }) => file.id),
-        });
+        const session = (
+          await db.query('SELECT source FROM guest_sessions WHERE id=$1', [
+            message.session_id,
+          ])
+        ).rows[0];
+        const receipt = await this.inquiries.chat.deliver(
+          { ...inquiry, session_id: message.session_id, source: session.source } as any,
+          {
+            id: message.id,
+            html: message.html,
+            attachmentIds: message.attachments.map((file: { id: string }) => file.id),
+          },
+        );
         await db.transaction(async (client) => {
           const bound = await client.query(
             'UPDATE inquiries SET topic_id=$2 WHERE id=$1 AND (topic_id IS NULL OR topic_id=$2) RETURNING id',

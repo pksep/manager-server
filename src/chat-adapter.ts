@@ -45,9 +45,12 @@ export class ChatAdapter {
           redirect: 'error',
         },
       );
+      if (response.status === 403)
+        throw new ForbiddenException('У сотрудника нет доступа к обращениям');
       if (!response.ok) throw new Error(`chat_http_${response.status}`);
       return response;
-    } catch {
+    } catch (error) {
+      if (error instanceof ForbiddenException) throw error;
       throw new ServiceUnavailableException('Нет связи с СЭП Чатом');
     }
   }

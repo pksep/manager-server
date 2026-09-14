@@ -205,6 +205,7 @@ beforeAll(async () => {
   await startManager();
 }, 60000);
 afterAll(async () => {
+  runtime?.app.getHttpServer().closeAllConnections();
   await runtime?.close();
   await proxy?.stop(true);
   await Promise.all([db.end(), erpDb.end(), chatDb.end()]);
@@ -424,15 +425,16 @@ test('manager получает кандидатов и синхронизиру�
     ).rows[0].responsible_id,
   ).toBe(actor.userId);
   const next = await openInquiry(inquiry.contacts);
+  expect(next.inquiryId).toBe(inquiry.inquiryId);
+  expect((await staffCall(next.inquiryId)).inquiry.customer_id).toBe(
+    detail.inquiry.customer_id,
+  );
   expect(
     (await staffCall(next.inquiryId + '/erp/candidates')).map((row: any) => row.id),
   ).toContain(Number(operation.erp_contact_id));
-  const link = randomUUID();
-  await staffCall(next.inquiryId + '/erp/sync', {
-    operationId: link,
-    contactId: Number(operation.erp_contact_id),
-  });
-  expect((await completed(link)).erp_contact_id).toBe(operation.erp_contact_id);
+  expect((await staffCall(next.inquiryId)).inquiry.erp_contact_id).toBe(
+    operation.erp_contact_id,
+  );
   const history = await staffCall(next.inquiryId + '/history');
   expect(new Set(history.messages.map((message: any) => message.inquiry_id))).toEqual(
     new Set([inquiry.inquiryId, next.inquiryId]),
@@ -447,13 +449,16 @@ test('manager получает кандидатов и синхронизиру�
     )
   ).json()) as any;
   expect(guestHistory.messages).toHaveLength(1);
-  await request(
-    manager + `/v1/widget/inquiries/${inquiry.inquiryId}/messages`,
-    {
-      headers: { Origin: origin, Authorization: `Bearer ${next.guest.token}` },
-    },
-    404,
-  );
+  const repeatedHistory = (await (
+    await request(
+      manager + `/v1/widget/inquiries/${inquiry.inquiryId}/messages`,
+      {
+        headers: { Origin: origin, Authorization: `Bearer ${next.guest.token}` },
+      },
+      200,
+    )
+  ).json()) as any;
+  expect(repeatedHistory.messages).toEqual(guestHistory.messages);
 });
 
 test('потеря ответа ЕРП и перезапуск manager не создают второй контакт', async () => {
@@ -463,6 +468,7 @@ test('потеря ответа ЕРП и перезапуск manager не со
   dropped = false;
   await staffCall(inquiry.inquiryId + '/erp/sync', { operationId });
   await until(async () => dropped, Boolean);
+  runtime.app.getHttpServer().closeAllConnections();
   await runtime.close();
   const before = (
     await erpDb.query(

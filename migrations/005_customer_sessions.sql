@@ -1,0 +1,12 @@
+ALTER TABLE customers ADD COLUMN merged_into uuid REFERENCES customers(id);
+ALTER TABLE inquiries ADD COLUMN merged_into uuid REFERENCES inquiries(id);
+ALTER TABLE guest_sessions ADD COLUMN inquiry_id uuid REFERENCES inquiries(id);
+UPDATE guest_sessions g SET inquiry_id=i.id FROM inquiries i WHERE i.session_id=g.id;
+CREATE INDEX guest_sessions_inquiry ON guest_sessions(inquiry_id);
+ALTER TABLE messages ADD COLUMN session_id uuid REFERENCES guest_sessions(id);
+UPDATE messages m SET session_id=i.session_id FROM inquiries i WHERE i.id=m.inquiry_id;
+ALTER TABLE messages ALTER COLUMN session_id SET NOT NULL;
+ALTER TABLE messages DROP CONSTRAINT messages_inquiry_id_operation_id_key;
+ALTER TABLE messages ADD CONSTRAINT messages_session_operation UNIQUE(session_id,operation_id);
+CREATE INDEX messages_session_history ON messages(session_id,inquiry_id,sequence);
+CREATE UNIQUE INDEX inquiries_active_customer ON inquiries(customer_id) WHERE status='OPEN' AND merged_into IS NULL;

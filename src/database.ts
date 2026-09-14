@@ -44,6 +44,8 @@ export class Database implements OnModuleDestroy {
         '001_initial.sql',
         '002_erp_sync.sql',
         '003_customer_history.sql',
+        '004_inquiry_metadata.sql',
+        '005_customer_sessions.sql',
       ];
       for (const [index, file] of migrations.entries()) {
         const version = index + 1;

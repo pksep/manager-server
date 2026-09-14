@@ -129,6 +129,7 @@ export const ChatEventSchema = z.object({
   type: z.enum(['message', 'read']),
   messageId: z.uuid(),
   senderId: z.uuid(),
+  guestSessionId: z.uuid(),
   author: z.string().max(200),
   avatarUrl: safeUrl.optional(),
   direction: z.enum(['incoming', 'outgoing']),
