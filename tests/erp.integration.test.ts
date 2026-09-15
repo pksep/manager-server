@@ -12,7 +12,9 @@ if (
   url.hostname !== '127.0.0.1' ||
   url.port !== '56441' ||
   url.pathname !== '/manager_local' ||
-  config.ERP_SERVICE_URL !== 'http://127.0.0.1:4502/api' ||
+  !['http://127.0.0.1:4502/api', 'http://127.0.0.1:4503/api'].includes(
+    config.ERP_SERVICE_URL || '',
+  ) ||
   config.CHAT_SERVICE_URL !== 'http://127.0.0.1:4501/api'
 )
   throw new Error('Разрешён только изолированный стенд manager');
@@ -24,7 +26,7 @@ const chatDb = new Pool({ connectionString: url.toString() });
 const actor = JSON.parse(
   readFileSync('../.worktrees/manager-erp-server/.local/erp-actor.json', 'utf8'),
 ) as { userId: number; roleId: number };
-const erp = 'http://127.0.0.1:4502/api',
+const erp = config.ERP_SERVICE_URL!,
   chat = config.CHAT_SERVICE_URL,
   manager = 'http://127.0.0.1:4314',
   origin = 'http://127.0.0.1:4310';
@@ -356,19 +358,41 @@ test('отказ записи журнала откатывает контакт
 
 test('актуальные права ЕРП проверяются для чтения, создания и повторов', async () => {
   const previous = (
-    await erpDb.query('SELECT accesses FROM roles WHERE id=$1', [actor.roleId])
-  ).rows[0].accesses;
+    await erpDb.query('SELECT permission_id FROM role_permissions WHERE role_id=$1', [
+      actor.roleId,
+    ])
+  ).rows.map((row) => row.permission_id);
+  async function setPermissions(ids: number[]) {
+    const client = await erpDb.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'UPDATE roles SET permissions_version=permissions_version+1 WHERE id=$1',
+        [actor.roleId],
+      );
+      await client.query('DELETE FROM role_permissions WHERE role_id=$1', [actor.roleId]);
+      await client.query(
+        'INSERT INTO role_permissions(role_id,permission_id,"createdAt","updatedAt") SELECT $1,unnest($2::int[]),now(),now()',
+        [actor.roleId, ids],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
   try {
-    await erpDb.query(
-      "UPDATE roles SET accesses=jsonb_set(accesses,'{manager,read}','false') WHERE id=$1",
-      [actor.roleId],
-    );
+    await setPermissions([]);
     await erpCall('candidates', identity, 403);
     await erpCall('sync', first, 403);
-    await erpDb.query(
-      "UPDATE roles SET accesses=jsonb_set($2::jsonb,'{contactBase,changeEverything}','false') WHERE id=$1",
-      [actor.roleId, previous],
-    );
+    const permission = (
+      await erpDb.query(
+        "SELECT p.id FROM authorization_permissions p JOIN authorization_resources r ON r.id=p.resource_id WHERE r.code='chat.clients' AND p.action='view'",
+      )
+    ).rows[0].id;
+    await setPermissions([permission]);
     await erpCall(
       'sync',
       {
@@ -377,7 +401,7 @@ test('актуальные права ЕРП проверяются для чт�
         customerId: randomUUID(),
         identity: freshIdentity(),
       },
-      403,
+      201,
     );
     expect(
       (
@@ -390,10 +414,7 @@ test('актуальные права ЕРП проверяются для чт�
       ).created,
     ).toBe(false);
   } finally {
-    await erpDb.query('UPDATE roles SET accesses=$2 WHERE id=$1', [
-      actor.roleId,
-      previous,
-    ]);
+    await setPermissions(previous);
   }
 });
 

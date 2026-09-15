@@ -1,5 +1,6 @@
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const staffContext = await browser.newContext({
@@ -60,6 +61,20 @@ async function waitLinked(inquiryId) {
 }
 
 try {
+  // Полный сервер ЕРП использует штатную авторизацию вместо тестового bootstrap.
+  if (process.env.MANAGER_ERP_LOGIN_FILE) {
+    const login = JSON.parse(readFileSync(process.env.MANAGER_ERP_LOGIN_FILE, 'utf8'));
+    const erp = await staffContext.newPage();
+    await erp.goto('http://127.0.0.3:4315/');
+    await erp
+      .getByPlaceholder('Введите табельный номер', { exact: true })
+      .fill(login.tabel, { timeout: 60000 });
+    await erp.getByPlaceholder('Введите табельный номер', { exact: true }).press('Tab');
+    await erp.locator('input[type="password"]').fill(login.password);
+    await erp.getByTestId('LoginForm-Login-Button').click();
+    await erp.locator('.main-layout #nav').waitFor({ timeout: 60000 });
+    await erp.close();
+  }
   await chat.goto('http://127.0.0.2:4312/');
   await chat.locator('[data-testid$="MenuBottomNav-Clients"]').click({ timeout: 60000 });
   const existing = (await manager('inquiries?page=1')).find(

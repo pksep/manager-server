@@ -87,6 +87,7 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            compress: 'no-compress',
             'x-manager-key': key,
             'x-erp-actor-id': String(actorId),
           },
