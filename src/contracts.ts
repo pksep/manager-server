@@ -87,7 +87,11 @@ export const SourceSchema = z.object({
   referrerOrigin: z.union([origin, z.literal('')]),
 });
 export const SessionRequestSchema = z
-  .object({ siteId: identifier, source: SourceSchema })
+  .object({
+    siteId: identifier,
+    source: SourceSchema,
+    visitorToken: z.string().max(110).optional(),
+  })
   .strict();
 export const SendRequestSchema = z
   .object({

@@ -5,7 +5,6 @@ import {
   Injectable,
   NotFoundException,
   ServiceUnavailableException,
-  type OnModuleDestroy,
   type OnModuleInit,
 } from '@nestjs/common';
 import { createHash } from 'node:crypto';
@@ -37,21 +36,12 @@ interface ErpJob {
 }
 
 @Injectable()
-export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
-  private timer?: ReturnType<typeof setInterval>;
-  private running?: Promise<void>;
-  private stopped = false;
+export class ErpSyncService implements OnModuleInit {
   constructor(@Inject(InquiriesService) private readonly inquiries: InquiriesService) {}
 
-  onModuleInit() {
+  async onModuleInit(): Promise<void> {
     if (!this.inquiries.config.ERP_SERVICE_URL) return;
-    this.timer = setInterval(() => void this.tick(), 1000);
-    this.timer.unref();
-  }
-  async onModuleDestroy() {
-    this.stopped = true;
-    clearInterval(this.timer);
-    await this.running;
+    await this.inquiries.queue.register('erp', (id) => this.process(id));
   }
 
   private async customer(inquiryId: string) {
@@ -138,7 +128,7 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
         JSON.stringify({ customerId: customer.id, contactId: input.contactId || null }),
       )
       .digest('hex');
-    return this.inquiries.database.transaction(async (db) => {
+    const result = await this.inquiries.database.transaction(async (db) => {
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
         `manager:erp-operation:${input.operationId}`,
       ]);
@@ -189,6 +179,8 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
       ).rows[0];
       return this.publicJob(job);
     });
+    await this.inquiries.queue.enqueue('erp', result.id);
+    return result;
   }
   private publicJob(job: ErpJob) {
     return { id: job.id, customerId: job.customer_id, state: job.state };
@@ -197,7 +189,7 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
   /** Возобновляет тот же запрос; исходный инициатор и параметры сохраняются. */
   async retry(inquiryId: string, operationId: string) {
     const customer = await this.customer(inquiryId);
-    return this.inquiries.database.transaction(async (db) => {
+    const result = await this.inquiries.database.transaction(async (db) => {
       await db.query('SELECT id FROM customers WHERE id=$1 FOR UPDATE', [customer.id]);
       const active = await db.query(
         "SELECT id FROM erp_sync_operations WHERE customer_id=$1 AND state IN ('pending','working','completed')",
@@ -216,70 +208,71 @@ export class ErpSyncService implements OnModuleInit, OnModuleDestroy {
       if (!job) throw new ConflictException('Операция не ожидает повтора');
       return this.publicJob(job);
     });
+    await this.inquiries.queue.enqueue('erp', result.id);
+    return result;
   }
-  /** Обрабатывает сохранённые операции независимо от доставки сообщений. */
-  tick(): Promise<void> {
-    if (this.running || this.stopped) return this.running ?? Promise.resolve();
-    this.running = this.run()
-      .catch(() => {})
-      .finally(() => {
-        this.running = undefined;
-      });
-    return this.running;
-  }
-  private async run() {
-    for (let index = 0; index < 10 && !this.stopped; index++) {
-      const job = await this.inquiries.database.transaction(async (db) => {
-        const row = (
-          await db.query<ErpJob>(`SELECT * FROM erp_sync_operations
-          WHERE (state='pending' AND next_attempt_at<=now()) OR (state='working' AND locked_until<now())
-          ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1`)
-        ).rows[0];
-        if (row)
-          await db.query(
-            "UPDATE erp_sync_operations SET state='working',attempts=attempts+1,locked_until=now()+interval '30 seconds',updated_at=now() WHERE id=$1",
-            [row.id],
-          );
-        return row;
-      });
-      if (!job) return;
-      try {
-        const actor = await this.inquiries.chat.erpActor(job.actor_id);
-        if (actor !== job.erp_actor_id)
-          throw new HttpException('Связь сотрудника с ЕРП изменилась', 403);
-        const result = z
-          .object({
-            customerId: z.uuid(),
-            contactId: z.number().int().positive(),
-            created: z.boolean(),
-          })
-          .parse(await this.request(actor, 'sync', job.request));
-        if (result.customerId !== job.customer_id)
-          throw new Error('erp_contract_mismatch');
-        await this.inquiries.database.transaction(async (db) => {
-          const changed = await db.query(
-            'UPDATE customers SET erp_contact_id=$2 WHERE id=$1 AND (erp_contact_id IS NULL OR erp_contact_id=$2) RETURNING id',
-            [job.customer_id, String(result.contactId)],
-          );
-          if (!changed.rowCount) throw new ConflictException('Связь контакта изменилась');
-          await db.query(
-            "UPDATE erp_sync_operations SET state='completed',erp_contact_id=$2,last_error=NULL,locked_until=NULL,updated_at=now() WHERE id=$1",
-            [job.id, String(result.contactId)],
-          );
-        });
-      } catch (error) {
-        const status = error instanceof HttpException ? error.getStatus() : 503;
-        const state =
-          status === 409
-            ? 'conflict'
-            : status < 500 || job.attempts >= 9
-              ? 'failed'
-              : 'pending';
-        await this.inquiries.database.query(
-          "UPDATE erp_sync_operations SET state=$2,last_error=$3,locked_until=NULL,next_attempt_at=now()+($4 * interval '1 second'),updated_at=now() WHERE id=$1",
-          [job.id, state, `erp_${status}`, Math.min(60, 2 ** job.attempts)],
+  /** Получает задание RabbitMQ, повторяет только ту же операцию с исходным инициатором. */
+  private async process(operationId: string): Promise<'done' | 'retry'> {
+    const job = await this.inquiries.database.transaction(async (db) => {
+      const row = (
+        await db.query<ErpJob>(
+          `SELECT * FROM erp_sync_operations
+          WHERE id=$1 AND ((state='pending' AND next_attempt_at<=now()) OR (state='working' AND locked_until<now()))
+          ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1`,
+          [operationId],
+        )
+      ).rows[0];
+      if (row)
+        await db.query(
+          "UPDATE erp_sync_operations SET state='working',attempts=attempts+1,locked_until=now()+interval '30 seconds',updated_at=now() WHERE id=$1",
+          [row.id],
         );
-      }
+      return row;
+    });
+    if (!job) {
+      const existing = await this.inquiries.database.query<{ state: string }>(
+        'SELECT state FROM erp_sync_operations WHERE id=$1',
+        [operationId],
+      );
+      return ['pending', 'working'].includes(existing.rows[0]?.state) ? 'retry' : 'done';
+    }
+    try {
+      const actor = await this.inquiries.chat.erpActor(job.actor_id);
+      if (actor !== job.erp_actor_id)
+        throw new HttpException('Связь сотрудника с ЕРП изменилась', 403);
+      const result = z
+        .object({
+          customerId: z.uuid(),
+          contactId: z.number().int().positive(),
+          created: z.boolean(),
+        })
+        .parse(await this.request(actor, 'sync', job.request));
+      if (result.customerId !== job.customer_id) throw new Error('erp_contract_mismatch');
+      await this.inquiries.database.transaction(async (db) => {
+        const changed = await db.query(
+          'UPDATE customers SET erp_contact_id=$2 WHERE id=$1 AND (erp_contact_id IS NULL OR erp_contact_id=$2) RETURNING id',
+          [job.customer_id, String(result.contactId)],
+        );
+        if (!changed.rowCount) throw new ConflictException('Связь контакта изменилась');
+        await db.query(
+          "UPDATE erp_sync_operations SET state='completed',erp_contact_id=$2,last_error=NULL,locked_until=NULL,updated_at=now() WHERE id=$1",
+          [job.id, String(result.contactId)],
+        );
+      });
+      return 'done';
+    } catch (error) {
+      const status = error instanceof HttpException ? error.getStatus() : 503;
+      const state =
+        status === 409
+          ? 'conflict'
+          : status < 500 || job.attempts >= 9
+            ? 'failed'
+            : 'pending';
+      await this.inquiries.database.query(
+        "UPDATE erp_sync_operations SET state=$2,last_error=$3,locked_until=NULL,next_attempt_at=now()+($4 * interval '1 second'),updated_at=now() WHERE id=$1",
+        [job.id, state, `erp_${status}`, Math.min(60, 2 ** job.attempts)],
+      );
+      return state === 'pending' ? 'retry' : 'done';
     }
   }
 }

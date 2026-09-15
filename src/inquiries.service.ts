@@ -12,9 +12,9 @@ import {
 } from '@nestjs/common';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import sanitizeHtml from 'sanitize-html';
-import type { PoolClient } from 'pg';
+import { Op } from 'sequelize';
 import { CONFIG, type Config } from './config';
-import { Database } from './database';
+import { Database, type DatabaseTransaction } from './database';
 import { ChatAdapter } from './chat-adapter';
 import {
   SessionRequestSchema,
@@ -26,17 +26,22 @@ import {
 } from './contracts';
 import { normalizeContacts, resolveCustomer } from './identity';
 import { multipartFilename } from './filename';
+import { SecurityService, type SecurityContext } from './security';
+import { FileInspection } from './secure-upload';
+import { OperationQueue } from './operation-queue';
+import { WidgetSettings } from './widget-settings';
 
 export const hash = (value: string | Buffer) =>
   createHash('sha256').update(value).digest('hex');
 export interface Guest {
   id: string;
+  visitor_id?: string | null;
   site_id: string;
   source: Record<string, unknown>;
   origin: string;
   expires_at: Date;
 }
-type MessageRow = {
+export type MessageRow = {
   id: string;
   inquiry_id: string;
   session_id: string;
@@ -72,24 +77,25 @@ export class InquiriesService implements OnModuleInit {
     @Inject(Database) readonly database: Database,
     @Inject(CONFIG) readonly config: Config,
     @Inject(ChatAdapter) readonly chat: ChatAdapter,
+    @Inject(SecurityService) readonly security: SecurityService,
+    @Inject(FileInspection) private readonly files: FileInspection,
+    @Inject(OperationQueue) readonly queue: OperationQueue,
+    @Inject(WidgetSettings) private readonly settings: WidgetSettings,
   ) {}
   async onModuleInit() {
     const version = await this.database.query(
-      'SELECT version FROM manager_schema_migrations WHERE version=5',
+      'SELECT version FROM manager_schema_migrations WHERE version=7',
     );
     if (!version.rowCount) throw new Error('Сначала примените миграции manager');
     for (const site of this.config.sites)
-      await this.database.query(
-        'INSERT INTO sites(id,name,origins,widget_origins,config,enabled) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET name=excluded.name,origins=excluded.origins,widget_origins=excluded.widget_origins,config=excluded.config,enabled=excluded.enabled',
-        [
-          site.id,
-          site.name,
-          JSON.stringify(site.origins),
-          JSON.stringify(site.widgetOrigins),
-          site.config,
-          site.enabled,
-        ],
-      );
+      await this.database.models.Site.upsert({
+        id: site.id,
+        name: site.name,
+        origins: site.origins,
+        widget_origins: site.widgetOrigins,
+        config: site.config,
+        enabled: site.enabled,
+      });
   }
   site(id: string): Site {
     const site = this.config.sites.find((site) => site.id === id && site.enabled);
@@ -97,6 +103,8 @@ export class InquiriesService implements OnModuleInit {
     return site;
   }
   async ready() {
+    this.security.assertReady();
+    this.queue.assertReady();
     const result = await this.database.query<{ count: string }>(
       "SELECT count(*) FROM delivery_operations WHERE state IN ('pending','working')",
     );
@@ -105,21 +113,16 @@ export class InquiriesService implements OnModuleInit {
   }
   /** Ограничивает публичный приём совместно для всех экземпляров сервиса. */
   async rateLimit(key: string, limit: number) {
-    const result = await this.database.query<{ count: number }>(
-      `INSERT INTO rate_buckets(key,window_start,count) VALUES($1,now(),1) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN rate_buckets.window_start<now()-interval '1 minute' THEN 1 ELSE rate_buckets.count+1 END, window_start=CASE WHEN rate_buckets.window_start<now()-interval '1 minute' THEN now() ELSE rate_buckets.window_start END RETURNING count`,
-      [key],
-    );
-    if (result.rows[0].count > limit)
-      throw new HttpException('Слишком много запросов', 429);
+    await this.security.consume([{ key, capacity: limit, window: 60000 }]);
   }
   async guest(token: string, origin: string): Promise<Guest> {
     if (!/^[a-f0-9]{64}$/.test(token))
       throw new UnauthorizedException('Сессия недействительна');
-    const result = await this.database.query<Guest>(
-      'SELECT id,site_id,source,origin,expires_at FROM guest_sessions WHERE token_hash=$1 AND expires_at>now()',
-      [hash(token)],
-    );
-    const guest = result.rows[0];
+    const model = await this.database.models.GuestSession.findOne({
+      where: { token_hash: hash(token), expires_at: { [Op.gt]: new Date() } },
+      attributes: ['id', 'site_id', 'source', 'origin', 'expires_at', 'visitor_id'],
+    });
+    const guest = model?.get({ plain: true });
     if (
       !guest ||
       guest.origin !== origin ||
@@ -128,18 +131,20 @@ export class InquiriesService implements OnModuleInit {
       throw new UnauthorizedException('Сессия недействительна');
     return guest;
   }
-  async session(body: unknown, origin: string, token: string) {
+  async session(body: unknown, origin: string, token: string, context: SecurityContext) {
     const input = SessionRequestSchema.parse(body),
       site = this.site(input.siteId);
     const pageUrl = new URL(input.source.pageUrl);
     if (!site.widgetOrigins.includes(origin) || !site.origins.includes(pageUrl.origin))
       throw new ForbiddenException('Источник не разрешён');
     await this.ready();
+    const visitorToken = this.security.visitor(input.visitorToken);
     let guest: Guest;
     if (token) {
       guest = await this.guest(token, origin);
       if (guest.site_id !== site.id) throw new ForbiddenException('Сессия другого сайта');
     } else {
+      await this.security.newSession(context, site.id, visitorToken);
       token = randomBytes(32).toString('hex');
       const source = {
         siteId: site.id,
@@ -149,22 +154,21 @@ export class InquiriesService implements OnModuleInit {
         title: input.source.title,
         referrerOrigin: input.source.referrerOrigin,
       };
-      const result = await this.database.query<Guest>(
-        "INSERT INTO guest_sessions(id,token_hash,site_id,origin,source,expires_at) VALUES($1,$2,$3,$4,$5,now()+$6*interval '1 hour') RETURNING id,site_id,source,origin,expires_at",
-        [
-          randomUUID(),
-          hash(token),
-          site.id,
-          origin,
-          source,
-          this.config.MANAGER_SESSION_HOURS,
-        ],
-      );
-      guest = result.rows[0];
+      const result = await this.database.models.GuestSession.create({
+        id: randomUUID(),
+        visitor_id: visitorToken.split('.')[0],
+        token_hash: hash(token),
+        site_id: site.id,
+        origin,
+        source,
+        expires_at: new Date(Date.now() + this.config.MANAGER_SESSION_HOURS * 3600000),
+      });
+      guest = result.get({ plain: true });
     }
     return {
       token,
-      config: site.config,
+      visitorToken,
+      config: this.settings.publicConfig(site.config),
       serverTime: new Date().toISOString(),
       ...(await this.snapshot(guest)),
     };
@@ -200,7 +204,7 @@ export class InquiriesService implements OnModuleInit {
       nextCursor: result.rows.at(-1)?.sequence ?? after,
     };
   }
-  async send(guest: Guest, body: unknown, inquiryId?: string) {
+  async send(guest: Guest, body: unknown, inquiryId?: string, context?: SecurityContext) {
     const input = SendRequestSchema.parse(body),
       site = this.site(guest.site_id);
     const html = sanitizeHtml(input.html, {
@@ -242,7 +246,7 @@ export class InquiriesService implements OnModuleInit {
         contacts: input.contacts ?? null,
       }),
     );
-    return this.database.transaction(async (client) => {
+    const result = await this.database.transaction(async (client) => {
       await client.query('SELECT id FROM guest_sessions WHERE id=$1 FOR UPDATE', [
         guest.id,
       ]);
@@ -263,7 +267,7 @@ export class InquiriesService implements OnModuleInit {
       }
       if (inquiry) {
         const existing = (
-          await client.query(
+          await client.query<MessageRow & { fingerprint: string }>(
             'SELECT * FROM messages WHERE session_id=$1 AND operation_id=$2',
             [guest.id, input.operationId],
           )
@@ -279,6 +283,17 @@ export class InquiriesService implements OnModuleInit {
         if (!inquiryId) throw new ConflictException('В этой сессии уже есть обращение');
         if (inquiry.status !== 'OPEN') throw new ConflictException('Обращение закрыто');
       }
+      if (!context) throw new ForbiddenException('Источник запроса не определён');
+      context.visitor = guest.visitor_id || guest.id;
+      await this.security.message(
+        context,
+        guest.site_id,
+        guest.id,
+        input.operationId,
+        text,
+        input.attachmentIds,
+        !inquiry,
+      );
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtext('manager:queue-capacity'))",
       );
@@ -379,6 +394,8 @@ export class InquiriesService implements OnModuleInit {
         message: presentMessage(message),
       };
     });
+    await this.queue.enqueue('delivery', result.message.id);
+    return result;
   }
   async upload(
     guest: Guest,
@@ -393,9 +410,9 @@ export class InquiriesService implements OnModuleInit {
       multipartFilename(file.originalname)
         .replace(/[\x00-\x1f/\\]/g, '_')
         .slice(0, 255) || 'Файл';
-    const fingerprint = hash(
-      Buffer.concat([Buffer.from(`${name}\0${file.mimetype}\0`), file.buffer]),
-    );
+    const inspected = await this.files.inspect(file.path, name, file.size, file.mimetype);
+    file.mimetype = inspected.mime;
+    const fingerprint = inspected.fingerprint;
     const attachment = await this.database.transaction(async (client) => {
       await client.query('SELECT id FROM guest_sessions WHERE id=$1 FOR UPDATE', [
         guest.id,
@@ -407,7 +424,10 @@ export class InquiriesService implements OnModuleInit {
         )
       ).rows[0];
       if (existing) {
-        if (existing.fingerprint !== fingerprint)
+        if (
+          existing.fingerprint !== fingerprint &&
+          existing.fingerprint !== inspected.legacyFingerprint
+        )
           throw new ConflictException('Ключ загрузки уже использован');
         return existing;
       }
@@ -460,7 +480,7 @@ export class InquiriesService implements OnModuleInit {
       file: result.rows[0],
     };
   }
-  async publish(client: PoolClient, sessionId: string, messageId: string) {
+  async publish(client: DatabaseTransaction, sessionId: string, messageId: string) {
     await client.query('INSERT INTO widget_events(session_id,message_id) VALUES($1,$2)', [
       sessionId,
       messageId,
@@ -524,7 +544,27 @@ export class InquiriesService implements OnModuleInit {
               event.author,
               event.senderId,
               event.avatarUrl ?? null,
-              event.html,
+              sanitizeHtml(event.html, {
+                allowedTags: [
+                  'p',
+                  'br',
+                  'strong',
+                  'b',
+                  'em',
+                  'i',
+                  'u',
+                  's',
+                  'ul',
+                  'ol',
+                  'li',
+                  'blockquote',
+                  'code',
+                  'a',
+                ],
+                allowedAttributes: { a: ['href', 'title'] },
+                allowedSchemes: ['https', 'http', 'mailto'],
+                allowProtocolRelative: false,
+              }),
               JSON.stringify(event.attachments),
               event.createdAt,
               sessionId,

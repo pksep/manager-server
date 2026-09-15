@@ -1,6 +1,6 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
-import type { PoolClient } from 'pg';
+import type { DatabaseTransaction } from './database';
 import { domainToASCII } from 'node:url';
 import type { Contacts, WidgetConfig } from './contracts';
 
@@ -32,7 +32,7 @@ export function normalizeContacts(
 
 /** Совпадение обоих реквизитов связывает карточку, но не даёт доступ к истории сессий. */
 export async function resolveCustomer(
-  client: PoolClient,
+  client: DatabaseTransaction,
   contacts: Contacts,
   normalized: { phone: string; email: string },
 ): Promise<string> {
@@ -54,10 +54,9 @@ export async function resolveCustomer(
     if (matches.length) return matches[0].id;
   }
   const id = randomUUID();
-  await client.query('INSERT INTO customers(id,name,contacts) VALUES($1,$2,$3)', [
-    id,
-    contacts.name,
-    contacts,
-  ]);
+  await client.models.Customer.create(
+    { id, name: contacts.name, contacts },
+    { transaction: client.transaction },
+  );
   return id;
 }

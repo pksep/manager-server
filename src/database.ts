@@ -1,69 +1,82 @@
 import { Inject, Injectable, type OnModuleDestroy } from '@nestjs/common';
-import { Pool, type PoolClient, type QueryResultRow } from 'pg';
-import { readFile } from 'node:fs/promises';
+import { Sequelize, type Transaction } from 'sequelize';
+import type { QueryResultRow } from 'pg';
 import { CONFIG, type Config } from './config';
+import { defineModels } from './models';
+import { runMigrations, type MigrationStatus } from './migrations';
+
+export interface DatabaseResult<T> {
+  rows: T[];
+  rowCount: number;
+}
+
+export interface DatabaseTransaction {
+  transaction: Transaction;
+  models: ReturnType<typeof defineModels>;
+  query<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    values?: unknown[],
+  ): Promise<DatabaseResult<T>>;
+}
 
 @Injectable()
 export class Database implements OnModuleDestroy {
-  readonly pool: Pool;
+  readonly sequelize: Sequelize;
+  readonly models: ReturnType<typeof defineModels>;
+
   constructor(@Inject(CONFIG) config: Config) {
-    this.pool = new Pool({
-      connectionString: config.DATABASE_URL,
-      max: 10,
-      connectionTimeoutMillis: 3000,
-      statement_timeout: 15000,
-      idle_in_transaction_session_timeout: 20000,
+    this.sequelize = new Sequelize(config.DATABASE_URL, {
+      dialect: 'postgres',
+      logging: false,
+      pool: { max: 10, min: 0, acquire: 3000, idle: 10000 },
+      dialectOptions: {
+        connectionTimeoutMillis: 3000,
+        statement_timeout: 15000,
+        idle_in_transaction_session_timeout: 20000,
+      },
+      retry: { max: 0 },
     });
-    this.pool.on('error', () => console.error('Соединение с базой manager потеряно'));
+    this.models = defineModels(this.sequelize);
   }
-  query<T extends QueryResultRow = QueryResultRow>(sql: string, values: unknown[] = []) {
-    return this.pool.query<T>(sql, values);
-  }
-  async transaction<T>(action: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await action(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-  /** Применяет миграции только базы сервиса обращений под общей блокировкой. */
-  async migrate() {
-    await this.transaction(async (client) => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtext('manager:migrations'))");
-      await client.query(
-        'CREATE TABLE IF NOT EXISTS manager_schema_migrations(version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())',
-      );
-      const migrations = [
-        '001_initial.sql',
-        '002_erp_sync.sql',
-        '003_customer_history.sql',
-        '004_inquiry_metadata.sql',
-        '005_customer_sessions.sql',
-      ];
-      for (const [index, file] of migrations.entries()) {
-        const version = index + 1;
-        const result = await client.query(
-          'SELECT version FROM manager_schema_migrations WHERE version=$1',
-          [version],
-        );
-        if (!result.rowCount) {
-          await client.query(await readFile(`migrations/${file}`, 'utf8'));
-          await client.query(
-            'INSERT INTO manager_schema_migrations(version) VALUES ($1)',
-            [version],
-          );
-        }
-      }
+
+  /** Параметризованный SQL оставлен для блокировок и составных выборок. */
+  async query<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    values: unknown[] = [],
+    transaction?: Transaction,
+  ): Promise<DatabaseResult<T>> {
+    const [rows, metadata] = await this.sequelize.query(sql, {
+      ...(values.length ? { bind: values } : {}),
+      transaction,
+      raw: true,
     });
+    const count =
+      metadata && typeof metadata === 'object' && 'rowCount' in metadata
+        ? Number(metadata.rowCount)
+        : rows.length;
+    return { rows: rows as T[], rowCount: Number.isFinite(count) ? count : rows.length };
   }
-  async onModuleDestroy() {
-    await this.pool.end();
+
+  /** ORM владеет commit/rollback, все вложенные операции используют одну транзакцию. */
+  async transaction<T>(action: (client: DatabaseTransaction) => Promise<T>): Promise<T> {
+    return this.sequelize.transaction((transaction) =>
+      action({
+        transaction,
+        models: this.models,
+        query: <R extends QueryResultRow = QueryResultRow>(
+          sql: string,
+          values: unknown[] = [],
+        ): Promise<DatabaseResult<R>> => this.query<R>(sql, values, transaction),
+      }),
+    );
+  }
+
+  /** Штатные up/down/status не запускаются из HTTP-приложения. */
+  async migrate(direction: 'up' | 'down' | 'status' = 'up'): Promise<MigrationStatus> {
+    return runMigrations(this, direction);
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    await this.sequelize.close();
   }
 }

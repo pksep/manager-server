@@ -78,3 +78,28 @@ test('контакты приводятся к сопоставимому вид
     normalizeContacts({ name: 'Иван', phone: '123', email: 'test@example.test' }, 'all'),
   ).toThrow();
 });
+
+test('ключи CAPTCHA обязательны вне локального режима; ссылка ВК появляется только из настройки', () => {
+  const env = {
+    DATABASE_URL: 'postgresql://localhost/unused',
+    CHAT_SERVICE_URL: 'http://127.0.0.1:4501/api',
+    CHAT_MANAGER_KEY: 'c'.repeat(32),
+    MANAGER_INTERNAL_KEY: 'm'.repeat(32),
+  };
+  expect(
+    readConfig(env).sites.every((site) =>
+      site.config.socialLinks.every((link) => link.icon !== 'vk'),
+    ),
+  ).toBe(true);
+  expect(
+    readConfig({
+      ...env,
+      VK_BUSINESS_URL: 'https://vk.com/company',
+    }).sites[0].config.socialLinks.some((link) => link.url === 'https://vk.com/company'),
+  ).toBe(true);
+  expect(() => readConfig({ ...env, HOST: '0.0.0.0' })).toThrow();
+  expect(() => readConfig({ ...env, MANAGER_CAPTCHA_MODE: 'required' })).toThrow();
+  expect(() =>
+    readConfig({ ...env, VK_BUSINESS_URL: 'https://vk.com.attacker.test' }),
+  ).toThrow();
+});

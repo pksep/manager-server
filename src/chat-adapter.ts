@@ -5,6 +5,9 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { z } from 'zod';
+import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
+import { randomBytes } from 'node:crypto';
 import { CONFIG, type Config } from './config';
 import {
   AttachmentSchema,
@@ -99,17 +102,37 @@ export class ChatAdapter {
       ).events;
   }
   async upload(id: string, sessionId: string, file: Express.Multer.File) {
-    const form = new FormData();
-    form.set('id', id);
-    form.set('guestSessionId', sessionId);
-    form.set(
-      'file',
-      new Blob([new Uint8Array(file.buffer)], { type: file.mimetype }),
-      file.originalname,
+    const boundary = `manager-${randomBytes(18).toString('hex')}`;
+    const filename = file.originalname.replace(/["\r\n\\]/g, '_');
+    const prefix = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="id"\r\n\r\n${id}\r\n--${boundary}\r\nContent-Disposition: form-data; name="guestSessionId"\r\n\r\n${sessionId}\r\n--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${file.mimetype}\r\n\r\n`,
     );
-    return AttachmentSchema.parse(
-      await (await this.request('/attachments', { method: 'POST', body: form })).json(),
-    );
+    const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const source = createReadStream(file.path);
+    const chunks = async function* (): AsyncGenerator<Buffer> {
+      yield prefix;
+      for await (const chunk of source)
+        yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      yield suffix;
+    };
+    const stream = Readable.from(chunks());
+    const init: RequestInit & { duplex: 'half' } = {
+      method: 'POST',
+      duplex: 'half',
+      body: Readable.toWeb(stream) as ReadableStream<Uint8Array>,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': String(prefix.length + file.size + suffix.length),
+      },
+    };
+    try {
+      return AttachmentSchema.parse(
+        await (await this.request('/attachments', init)).json(),
+      );
+    } finally {
+      source.destroy();
+      stream.destroy();
+    }
   }
   async download(id: string, sessionId: string) {
     return this.request(

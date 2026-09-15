@@ -8,8 +8,16 @@ import { createApplication } from '../dist/app';
 import { readConfig } from '../dist/config';
 import { ChatAdapter } from '../dist/chat-adapter';
 import { ChatEventSchema } from '../src/contracts';
+import {
+  localActors,
+  clientPermission,
+  awaitManagerAccess,
+} from './support/local-managers';
 
-const config = readConfig();
+const config = {
+  ...readConfig(),
+  MANAGER_REDIS_PREFIX: `manager-bridge-${randomUUID()}`,
+};
 const databaseUrl = new URL(config.DATABASE_URL);
 if (
   databaseUrl.hostname !== '127.0.0.1' ||
@@ -24,12 +32,14 @@ const origin = 'http://127.0.0.1:4310',
 const db = new Pool({ connectionString: config.DATABASE_URL });
 databaseUrl.pathname = '/manager_chat_local';
 const chatDb = new Pool({ connectionString: databaseUrl.toString() });
+databaseUrl.pathname = '/manager_erp_local';
+const erpDb = new Pool({ connectionString: databaseUrl.toString() });
+let previousBobAccess: boolean | undefined;
 let runtime: Awaited<ReturnType<typeof createApplication>>;
 let alice: { token: string; id: string },
   bob: { token: string; id: string },
   outsider: { token: string; id: string };
 let guest: any, inquiryId: string, topicId: string, guestMessageId: string;
-let revision = Date.now();
 const contacts = {
   name: 'Проверка Manager',
   phone: '+7999' + String(Date.now()).slice(-7),
@@ -106,10 +116,23 @@ async function session() {
   ).json();
 }
 async function login(name: string) {
+  const actor =
+    name === 'Менеджер А'
+      ? localActors[0]
+      : name === 'Менеджер Б'
+        ? localActors[1]
+        : undefined;
+  const existing = actor
+    ? (await chatDb.query('SELECT initials FROM users WHERE nickname=$1', [actor.tabel]))
+        .rows[0]
+    : undefined;
   const response = await request(
     chatBase + '/auth/login',
     json(
-      { nickname: `manager-test-${name}-${randomUUID()}`, initials: name },
+      {
+        nickname: actor?.tabel || `manager-test-${name}-${randomUUID()}`,
+        initials: existing?.initials || name,
+      },
       { 'x-service-key': config.MANAGER_INTERNAL_KEY },
     ),
     201,
@@ -118,21 +141,11 @@ async function login(name: string) {
   return { token: body.accessToken || body.token, id: body.user.id };
 }
 async function grants(ids: string[]) {
-  await request(
-    chatBase + '/internal/manager-access/snapshot',
-    {
-      ...json(
-        {
-          revision: ++revision,
-          expiresAt: new Date(Date.now() + 14 * 60 * 1000).toISOString(),
-          userIds: ids,
-        },
-        { 'x-manager-access-key': process.env.CHAT_MANAGER_ACCESS_KEY! },
-      ),
-      method: 'PUT',
-    },
-    200,
-  );
+  if (!ids.includes(alice.id))
+    throw new Error('Тест не должен отзывать роль администратора стенда');
+  await clientPermission(erpDb, localActors[1].roleId, ids.includes(bob.id));
+  await awaitManagerAccess(chatBase, bob.token, ids.includes(bob.id));
+  await awaitManagerAccess(chatBase, alice.token, true);
 }
 async function staffDetail(id = inquiryId) {
   return (
@@ -214,15 +227,21 @@ beforeAll(async () => {
   alice = await login('Менеджер А');
   bob = await login('Менеджер Б');
   outsider = await login('Без права');
+  previousBobAccess = await clientPermission(erpDb, localActors[1].roleId);
   await grants([alice.id, bob.id]);
 }, 60000);
 afterAll(async () => {
+  if (previousBobAccess !== undefined) {
+    await clientPermission(erpDb, localActors[1].roleId, previousBobAccess);
+    await awaitManagerAccess(chatBase, bob.token, previousBobAccess);
+  }
   sockets.forEach((socket) => socket.terminate());
   runtime?.app.getHttpServer().closeAllConnections();
   await runtime?.close();
   await db.end();
   await chatDb.end();
-}, 30000);
+  await erpDb.end();
+}, 60000);
 
 test('источник проверяется, чужой origin и запрос без сессии отклоняются', async () => {
   await request(
@@ -383,7 +402,11 @@ test('файлы проходят в обе стороны через S3 чат�
     return (
       await request(
         base + '/v1/widget/attachments',
-        { method: 'POST', headers: guestHeaders(), body: form },
+        {
+          method: 'POST',
+          headers: { ...guestHeaders(), 'X-Operation-Id': uploadOperation },
+          body: form,
+        },
         201,
       )
     ).json() as Promise<any>;
@@ -480,7 +503,10 @@ test('те же телефон и email продолжают один чат, а
       base + '/v1/widget/attachments',
       {
         method: 'POST',
-        headers: guestHeaders(newGuest.token),
+        headers: {
+          ...guestHeaders(newGuest.token),
+          'X-Operation-Id': String(form.get('operationId')),
+        },
         body: form,
       },
       201,
@@ -843,4 +869,4 @@ test('право раздела обязательно; отзыв закрыв�
     ),
     403,
   );
-}, 20000);
+}, 90000);

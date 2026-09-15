@@ -21,12 +21,13 @@ import {
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
-import { FileInterceptor } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { ZodError } from 'zod';
 import { type Guest, InquiriesService } from './inquiries.service';
+import { SecurityError } from './security';
+import { SecureUploadInterceptor } from './secure-upload';
 
 export type GuestRequest = Request & { guest: Guest };
 export function bearer(request: Request) {
@@ -68,7 +69,10 @@ export class SafeErrorFilter implements ExceptionFilter {
         error instanceof Error ? error.stack?.split('\n').slice(1).join('\n') : undefined,
       );
     }
+    if (error instanceof SecurityError && error.code === 'rate_limited')
+      response.setHeader('Retry-After', String(error.details.retryAfter || 30));
     response.status(status).json({
+      ...(error instanceof SecurityError ? { code: error.code, ...error.details } : {}),
       error:
         status >= 500
           ? 'Сервис временно недоступен'
@@ -94,21 +98,35 @@ export class WidgetController {
   constructor(@Inject(InquiriesService) private readonly inquiries: InquiriesService) {}
   /** Открывает ограниченный диалог посетителя без доступа к предыдущим обращениям. */
   @Post('session') async session(@Body() body: unknown, @Req() request: Request) {
-    await this.inquiries.rateLimit(`ip:${request.socket.remoteAddress || 'unknown'}`, 30);
-    return this.inquiries.session(body, request.headers.origin || '', bearer(request));
+    return this.inquiries.session(
+      body,
+      request.headers.origin || '',
+      bearer(request),
+      this.inquiries.security.context(request),
+    );
   }
   @Post('inquiries') @UseGuards(GuestGuard) sendFirst(
     @Req() request: GuestRequest,
     @Body() body: unknown,
   ) {
-    return this.inquiries.send(request.guest, body);
+    return this.inquiries.send(
+      request.guest,
+      body,
+      undefined,
+      this.inquiries.security.context(request),
+    );
   }
   @Post('inquiries/:id/messages') @UseGuards(GuestGuard) sendNext(
     @Req() request: GuestRequest,
     @Param('id', ParseUUIDPipe) id: string,
     @Body() body: unknown,
   ) {
-    return this.inquiries.send(request.guest, body, id);
+    return this.inquiries.send(
+      request.guest,
+      body,
+      id,
+      this.inquiries.security.context(request),
+    );
   }
   @Get('inquiries/:id/messages') @UseGuards(GuestGuard) history(
     @Req() request: GuestRequest,
@@ -119,16 +137,7 @@ export class WidgetController {
   }
   @Post('attachments')
   @UseGuards(GuestGuard)
-  @UseInterceptors(
-    FileInterceptor('file', {
-      limits: {
-        fileSize: 100 * 1024 * 1024,
-        files: 1,
-        fields: 1,
-        fieldSize: 100,
-      },
-    }),
-  )
+  @UseInterceptors(SecureUploadInterceptor)
   upload(
     @Req() request: GuestRequest,
     @Body('operationId') operationId: string,

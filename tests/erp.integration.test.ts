@@ -5,8 +5,12 @@ import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
 import { createApplication } from '../dist/app';
 import { readConfig } from '../dist/config';
+import { localActors, awaitManagerAccess } from './support/local-managers';
 
-const config = readConfig();
+const config = {
+  ...readConfig(),
+  MANAGER_REDIS_PREFIX: `manager-erp-test-${randomUUID()}`,
+};
 const url = new URL(config.DATABASE_URL);
 if (
   url.hostname !== '127.0.0.1' ||
@@ -40,7 +44,6 @@ let dropAck = false,
   dropped = false,
   offline = false;
 let staff: { id: string; token: string }, unmapped: { id: string; token: string };
-let revision = Date.now();
 let contactId: number;
 const identity = freshIdentity();
 const first = {
@@ -76,11 +79,19 @@ async function erpCall(path: string, body: unknown, status = 201, headers = erpH
   ).json() as Promise<any>;
 }
 async function login(name: string) {
+  const local = name === 'Менеджер ЕРП' ? localActors[0] : undefined;
+  const existing = local
+    ? (await chatDb.query('SELECT initials FROM users WHERE nickname=$1', [local.tabel]))
+        .rows[0]
+    : undefined;
   const body = (await (
     await request(
       chat + '/auth/login',
       json(
-        { nickname: 'manager-erp-' + randomUUID(), initials: name },
+        {
+          nickname: local?.tabel || 'manager-erp-' + randomUUID(),
+          initials: existing?.initials || name,
+        },
         { 'x-service-key': config.MANAGER_INTERNAL_KEY },
       ),
       201,
@@ -89,22 +100,8 @@ async function login(name: string) {
   return { token: body.accessToken || body.token, id: body.user.id };
 }
 async function grants() {
-  await request(
-    chat + '/internal/manager-access/snapshot',
-    {
-      ...json(
-        {
-          revision: ++revision,
-          expiresAt: new Date(Date.now() + 14 * 60 * 1000).toISOString(),
-          userIds: [staff.id, unmapped.id],
-          erpActors: [{ userId: staff.id, erpUserId: actor.userId }],
-        },
-        { 'x-manager-access-key': process.env.CHAT_MANAGER_ACCESS_KEY! },
-      ),
-      method: 'PUT',
-    },
-    200,
-  );
+  await awaitManagerAccess(chat, staff.token, true);
+  await awaitManagerAccess(chat, unmapped.token, false);
 }
 async function staffCall(
   path: string,
@@ -190,7 +187,11 @@ beforeAll(async () => {
       const body = await incoming.arrayBuffer();
       const response = await fetch(
         erp + new URL(incoming.url).pathname.replace(/^\/api/, ''),
-        { method: incoming.method, headers: incoming.headers, body },
+        {
+          method: incoming.method,
+          headers: incoming.headers,
+          ...(incoming.method === 'GET' || incoming.method === 'HEAD' ? {} : { body }),
+        },
       );
       if (dropAck && new URL(incoming.url).pathname.endsWith('/sync') && response.ok) {
         dropAck = false;
@@ -221,7 +222,11 @@ test('внутренний ключ не открывает обычные ма�
   await erpCall('candidates', identity, 401, { ...erpHeaders, 'x-erp-actor-id': '0' });
   await erpCall('candidates', { ...identity, admin: true }, 400);
   await erpCall('sync', { ...first, identity: { phone: '123' } }, 400);
-  await request(erp + '/contacts', json({}, erpHeaders), 401);
+  await request(
+    erp + '/contacts',
+    json({}, { ...erpHeaders, Origin: 'http://127.0.0.3:4315' }),
+    401,
+  );
 });
 
 test('пять одновременных запросов создают один контакт и одно штатное действие', async () => {
@@ -422,11 +427,17 @@ test('manager получает кандидатов и синхронизиру�
   const inquiry = await openInquiry();
   await staffCall(inquiry.inquiryId + '/erp/candidates', undefined, 403, unmapped);
   // Редактируемое ex не является источником прав или ERP actor.
+  const previousEx = (await chatDb.query('SELECT ex FROM users WHERE id=$1', [staff.id]))
+    .rows[0].ex;
   await chatDb.query('UPDATE users SET ex=$2 WHERE id=$1', [
     staff.id,
     { erpUserId: 2147483647 },
   ]);
-  expect(await staffCall(inquiry.inquiryId + '/erp/candidates')).toEqual([]);
+  try {
+    expect(await staffCall(inquiry.inquiryId + '/erp/candidates')).toEqual([]);
+  } finally {
+    await chatDb.query('UPDATE users SET ex=$2 WHERE id=$1', [staff.id, previousEx]);
+  }
   const operationId = randomUUID();
   const responses = await Promise.all(
     Array.from({ length: 3 }, () =>
