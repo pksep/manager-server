@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { SiteSchema } from './contracts';
 import { securitySettingsSchema } from './security-config';
+import { readChannels } from './channels/config';
 
 const settingsSchema = z.object({
   ...securitySettingsSchema.shape,
@@ -26,6 +27,7 @@ const settingsSchema = z.object({
     .refine((value) => !value.startsWith('REPLACE_'))
     .optional(),
   MANAGER_SITES_PATH: z.string().default('config/sites.example.json'),
+  MANAGER_CHANNELS_PATH: z.string().optional(),
   MANAGER_QUEUE_LIMIT: z.coerce.number().int().positive().default(10000),
   MANAGER_SESSION_HOURS: z.coerce.number().int().min(1).max(720).default(24),
   MANAGER_WORKER_MS: z.coerce.number().int().min(100).max(60000).default(1000),
@@ -118,7 +120,11 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     ];
   if (new Set(sites.map((site) => site.id)).size !== sites.length)
     throw new Error('Идентификаторы сайтов должны быть уникальными');
-  return { ...settings, sites };
+  return {
+    ...settings,
+    sites,
+    channels: readChannels(settings.MANAGER_CHANNELS_PATH, env),
+  };
 }
 export type Config = ReturnType<typeof readConfig>;
 export const CONFIG = Symbol('manager.config');

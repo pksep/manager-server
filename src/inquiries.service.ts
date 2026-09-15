@@ -23,6 +23,8 @@ import {
   type Attachment,
   type Site,
   type ChatEvent,
+  type SendRequest,
+  type Contacts,
 } from './contracts';
 import { normalizeContacts, resolveCustomer } from './identity';
 import { multipartFilename } from './filename';
@@ -30,6 +32,11 @@ import { SecurityService, type SecurityContext } from './security';
 import { FileInspection } from './secure-upload';
 import { OperationQueue } from './operation-queue';
 import { WidgetSettings } from './widget-settings';
+import {
+  type ReplyRoute,
+  type IncomingMessage,
+  capabilities,
+} from './channels/contracts';
 
 export const hash = (value: string | Buffer) =>
   createHash('sha256').update(value).digest('hex');
@@ -84,7 +91,7 @@ export class InquiriesService implements OnModuleInit {
   ) {}
   async onModuleInit() {
     const version = await this.database.query(
-      'SELECT version FROM manager_schema_migrations WHERE version=7',
+      'SELECT version FROM manager_schema_migrations WHERE version=8',
     );
     if (!version.rowCount) throw new Error('Сначала примените миграции manager');
     for (const site of this.config.sites)
@@ -154,16 +161,28 @@ export class InquiriesService implements OnModuleInit {
         title: input.source.title,
         referrerOrigin: input.source.referrerOrigin,
       };
-      const result = await this.database.models.GuestSession.create({
-        id: randomUUID(),
-        visitor_id: visitorToken.split('.')[0],
-        token_hash: hash(token),
-        site_id: site.id,
-        origin,
-        source,
-        expires_at: new Date(Date.now() + this.config.MANAGER_SESSION_HOURS * 3600000),
+      guest = await this.database.transaction(async (client) => {
+        const result = await client.models.GuestSession.create(
+          {
+            id: randomUUID(),
+            visitor_id: visitorToken.split('.')[0],
+            token_hash: hash(token),
+            site_id: site.id,
+            origin,
+            source,
+            expires_at: new Date(
+              Date.now() + this.config.MANAGER_SESSION_HOURS * 3600000,
+            ),
+          },
+          { transaction: client.transaction },
+        );
+        const created = result.get({ plain: true });
+        await client.query(
+          "INSERT INTO reply_routes(id,channel,source) VALUES($1,'widget',$2)",
+          [created.id, source],
+        );
+        return created;
       });
-      guest = result.get({ plain: true });
     }
     return {
       token,
@@ -239,6 +258,78 @@ export class InquiriesService implements OnModuleInit {
     const normalized = input.contacts
       ? normalizeContacts(input.contacts, site.config.contactPolicy)
       : undefined;
+    const route = (
+      await this.database.query<ReplyRoute>(
+        'SELECT * FROM reply_routes WHERE id=$1 AND channel=$2',
+        [guest.id, 'widget'],
+      )
+    ).rows[0];
+    if (!route) throw new UnauthorizedException('Сессия недействительна');
+    return this.storeIncoming(
+      route,
+      input,
+      html,
+      normalized,
+      inquiryId,
+      async (): Promise<void> => {
+        if (!context) throw new ForbiddenException('Источник запроса не определён');
+        context.visitor = guest.visitor_id || guest.id;
+        await this.security.message(
+          context,
+          guest.site_id,
+          guest.id,
+          input.operationId,
+          text,
+          input.attachmentIds,
+          !route.inquiry_id,
+        );
+      },
+      guest.site_id,
+    );
+  }
+
+  /** Каналы используют общие правила обращения после собственной проверки подлинности. */
+  async acceptChannel(
+    route: ReplyRoute,
+    message: IncomingMessage,
+    attachmentIds: string[],
+    operationId: string,
+  ): Promise<{ inquiryId: string; message: WidgetMessage }> {
+    if (
+      route.channel === 'widget' ||
+      !route.connection_id ||
+      route.external_user_id !== message.userId
+    )
+      throw new ForbiddenException('Маршрут сообщения недоступен');
+    const contacts = message.contacts || { name: message.author, phone: '', email: '' };
+    const normalized =
+      contacts.phone || contacts.email
+        ? normalizeContacts(contacts, 'name-and-one')
+        : { phone: '', email: '' };
+    const html = `<p>${message.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')}</p>`;
+    return this.storeIncoming(
+      route,
+      { operationId, html, attachmentIds, contacts },
+      html,
+      normalized,
+      route.inquiry_id || undefined,
+      async (): Promise<void> => {},
+      undefined,
+      message.createdAt,
+    );
+  }
+
+  /** Единая транзакция приёма: клиент, обращение, вложения и намерение доставки. */
+  private async storeIncoming(
+    route: ReplyRoute,
+    input: SendRequest,
+    html: string,
+    normalized: { phone: string; email: string } | undefined,
+    inquiryId: string | undefined,
+    checkBudget: () => Promise<void>,
+    siteId?: string,
+    createdAt?: string,
+  ): Promise<{ inquiryId: string; message: WidgetMessage }> {
     const fingerprint = hash(
       JSON.stringify({
         html,
@@ -247,13 +338,13 @@ export class InquiriesService implements OnModuleInit {
       }),
     );
     const result = await this.database.transaction(async (client) => {
-      await client.query('SELECT id FROM guest_sessions WHERE id=$1 FOR UPDATE', [
-        guest.id,
+      await client.query('SELECT id FROM reply_routes WHERE id=$1 FOR UPDATE', [
+        route.id,
       ]);
       let inquiry = (
         await client.query(
-          'SELECT i.* FROM inquiries i JOIN guest_sessions g ON g.inquiry_id=i.id WHERE g.id=$1 FOR UPDATE OF i',
-          [guest.id],
+          'SELECT i.* FROM inquiries i JOIN reply_routes g ON g.inquiry_id=i.id WHERE g.id=$1 FOR UPDATE OF i',
+          [route.id],
         )
       ).rows[0];
       if (inquiryId && inquiry?.id !== inquiryId) {
@@ -269,7 +360,7 @@ export class InquiriesService implements OnModuleInit {
         const existing = (
           await client.query<MessageRow & { fingerprint: string }>(
             'SELECT * FROM messages WHERE session_id=$1 AND operation_id=$2',
-            [guest.id, input.operationId],
+            [route.id, input.operationId],
           )
         ).rows[0];
         if (existing) {
@@ -280,20 +371,11 @@ export class InquiriesService implements OnModuleInit {
             message: presentMessage(existing),
           };
         }
-        if (!inquiryId) throw new ConflictException('В этой сессии уже есть обращение');
+        if (!inquiryId && route.channel === 'widget')
+          throw new ConflictException('В этой сессии уже есть обращение');
         if (inquiry.status !== 'OPEN') throw new ConflictException('Обращение закрыто');
       }
-      if (!context) throw new ForbiddenException('Источник запроса не определён');
-      context.visitor = guest.visitor_id || guest.id;
-      await this.security.message(
-        context,
-        guest.site_id,
-        guest.id,
-        input.operationId,
-        text,
-        input.attachmentIds,
-        !inquiry,
-      );
+      await checkBudget();
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtext('manager:queue-capacity'))",
       );
@@ -307,7 +389,7 @@ export class InquiriesService implements OnModuleInit {
       const uploads = (
         await client.query(
           'SELECT * FROM attachments WHERE id=ANY($1::uuid[]) AND session_id=$2 AND chat_id IS NOT NULL FOR UPDATE',
-          [input.attachmentIds, guest.id],
+          [input.attachmentIds, route.id],
         )
       ).rows;
       if (
@@ -318,15 +400,20 @@ export class InquiriesService implements OnModuleInit {
       if (!inquiry) {
         if (!input.contacts || !normalized)
           throw new BadRequestException('Оставьте контакты');
-        const customerId = await resolveCustomer(client, input.contacts, normalized);
+        const customerId = await this.resolveRouteCustomer(
+          client,
+          route,
+          input.contacts,
+          normalized,
+        );
         for (const [kind, value] of Object.entries({
-          session: guest.id,
+          ...(route.channel === 'widget' ? { session: route.id } : {}),
           ...normalized,
         }))
           if (value)
             await client.query(
               'INSERT INTO customer_identities(id,customer_id,site_id,kind,value,verified) VALUES($1,$2,$3,$4,$5,$6)',
-              [randomUUID(), customerId, site.id, kind, value, kind === 'session'],
+              [randomUUID(), customerId, siteId ?? null, kind, value, kind === 'session'],
             );
         inquiry = (
           await client.query(
@@ -338,17 +425,22 @@ export class InquiriesService implements OnModuleInit {
           inquiry = (
             await client.query(
               'INSERT INTO inquiries(id,session_id,site_id,customer_id,source) VALUES($1,$2,$3,$4,$5) RETURNING *',
-              [randomUUID(), guest.id, site.id, customerId, guest.source],
+              [randomUUID(), route.id, siteId ?? null, customerId, route.source],
             )
           ).rows[0];
-        await client.query('UPDATE guest_sessions SET inquiry_id=$2 WHERE id=$1', [
-          guest.id,
+        await client.query('UPDATE reply_routes SET inquiry_id=$2 WHERE id=$1', [
+          route.id,
           inquiry.id,
         ]);
+        if (route.channel === 'widget')
+          await client.query('UPDATE guest_sessions SET inquiry_id=$2 WHERE id=$1', [
+            route.id,
+            inquiry.id,
+          ]);
       }
       await client.query('UPDATE inquiries SET source=$2 WHERE id=$1', [
         inquiry.id,
-        guest.source,
+        route.source,
       ]);
       const author = (
         await client.query<{ name: string }>('SELECT name FROM customers WHERE id=$1', [
@@ -376,7 +468,7 @@ export class InquiriesService implements OnModuleInit {
             author,
             html,
             JSON.stringify(attachments),
-            guest.id,
+            route.id,
           ],
         )
       ).rows[0];
@@ -388,7 +480,15 @@ export class InquiriesService implements OnModuleInit {
         id,
         inquiry.id,
       ]);
-      await this.publish(client, guest.id, id);
+      if (createdAt)
+        await client.query('UPDATE messages SET created_at=$2 WHERE id=$1', [
+          id,
+          createdAt,
+        ]);
+      await client.query('UPDATE reply_routes SET last_inbound_at=now() WHERE id=$1', [
+        route.id,
+      ]);
+      await this.publish(client, route.id, id);
       return {
         inquiryId: inquiry.id as string,
         message: presentMessage(message),
@@ -397,14 +497,60 @@ export class InquiriesService implements OnModuleInit {
     await this.queue.enqueue('delivery', result.message.id);
     return result;
   }
+
+  private async resolveRouteCustomer(
+    client: DatabaseTransaction,
+    route: ReplyRoute,
+    contacts: Contacts,
+    normalized: { phone: string; email: string },
+  ): Promise<string> {
+    if (!route.connection_id) return resolveCustomer(client, contacts, normalized);
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+      `manager:identity:${route.connection_id}:${route.external_user_id}`,
+    ]);
+    const known = (
+      await client.query<{ customer_id: string }>(
+        'SELECT customer_id FROM channel_customers WHERE connection_id=$1 AND external_user_id=$2',
+        [route.connection_id, route.external_user_id],
+      )
+    ).rows[0];
+    if (known) return known.customer_id;
+    const customerId = await resolveCustomer(client, contacts, normalized);
+    await client.query(
+      'INSERT INTO channel_customers(connection_id,external_user_id,customer_id) VALUES($1,$2,$3)',
+      [route.connection_id, route.external_user_id, customerId],
+    );
+    return customerId;
+  }
   async upload(
     guest: Guest,
     operationId: string,
     file?: Express.Multer.File,
   ): Promise<Attachment> {
+    const route = (
+      await this.database.query<ReplyRoute>('SELECT * FROM reply_routes WHERE id=$1', [
+        guest.id,
+      ])
+    ).rows[0];
+    if (!route) throw new NotFoundException('Диалог не найден');
+    return this.uploadForRoute(
+      route,
+      operationId,
+      file,
+      this.site(guest.site_id).config.limits,
+    );
+  }
+
+  /** Проверяет и сохраняет файлы всех каналов в том же приватном хранилище Чата. */
+  async uploadForRoute(
+    route: ReplyRoute,
+    operationId: string,
+    file?: Express.Multer.File,
+    limits: { fileBytes: number; fileCount: number } = capabilities[route.channel],
+  ): Promise<Attachment> {
     if (!file || !/^[\w:-]{1,100}$/.test(operationId))
       throw new BadRequestException('Выберите файл');
-    if (file.size > this.site(guest.site_id).config.limits.fileBytes)
+    if (file.size > limits.fileBytes)
       throw new HttpException('Файл слишком большой', 413);
     const name =
       multipartFilename(file.originalname)
@@ -414,13 +560,13 @@ export class InquiriesService implements OnModuleInit {
     file.mimetype = inspected.mime;
     const fingerprint = inspected.fingerprint;
     const attachment = await this.database.transaction(async (client) => {
-      await client.query('SELECT id FROM guest_sessions WHERE id=$1 FOR UPDATE', [
-        guest.id,
+      await client.query('SELECT id FROM reply_routes WHERE id=$1 FOR UPDATE', [
+        route.id,
       ]);
       const existing = (
         await client.query(
           'SELECT * FROM attachments WHERE session_id=$1 AND operation_id=$2',
-          [guest.id, operationId],
+          [route.id, operationId],
         )
       ).rows[0];
       if (existing) {
@@ -435,18 +581,18 @@ export class InquiriesService implements OnModuleInit {
         (
           await client.query(
             'SELECT count(*) FROM attachments WHERE session_id=$1 AND inquiry_id IS NULL',
-            [guest.id],
+            [route.id],
           )
         ).rows[0].count,
       );
-      if (count >= this.site(guest.site_id).config.limits.fileCount)
+      if (count >= limits.fileCount)
         throw new HttpException('Слишком много незавершённых вложений', 429);
       return (
         await client.query(
           'INSERT INTO attachments(id,session_id,operation_id,fingerprint,name,size,mime) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',
           [
             randomUUID(),
-            guest.id,
+            route.id,
             operationId,
             fingerprint,
             name,
@@ -457,7 +603,7 @@ export class InquiriesService implements OnModuleInit {
       ).rows[0];
     });
     if (!attachment.chat_id) {
-      const receipt = await this.chat.upload(attachment.id, guest.id, {
+      const receipt = await this.chat.upload(attachment.id, route.id, {
         ...file,
         originalname: name,
       });
@@ -481,20 +627,21 @@ export class InquiriesService implements OnModuleInit {
     };
   }
   async publish(client: DatabaseTransaction, sessionId: string, messageId: string) {
-    await client.query('INSERT INTO widget_events(session_id,message_id) VALUES($1,$2)', [
-      sessionId,
-      messageId,
-    ]);
+    await client.query(
+      'INSERT INTO widget_events(session_id,message_id) SELECT $1,$2 WHERE EXISTS(SELECT 1 FROM guest_sessions WHERE id=$1)',
+      [sessionId, messageId],
+    );
   }
   /** Применяет события строго по порядку чата; чужие ответы не меняют ответственного. */
   async acceptEvents(inquiryId: string, events: ChatEvent[]) {
     if (!events.length) return;
+    const outgoing: string[] = [];
     await this.database.transaction(async (client) => {
       const header = (
         await client.query('SELECT session_id FROM inquiries WHERE id=$1', [inquiryId])
       ).rows[0];
       if (!header) throw new NotFoundException('Обращение не найдено');
-      await client.query('SELECT id FROM guest_sessions WHERE id=$1 FOR UPDATE', [
+      await client.query('SELECT id FROM reply_routes WHERE id=$1 FOR UPDATE', [
         header.session_id,
       ]);
       const inquiry = (
@@ -506,7 +653,7 @@ export class InquiriesService implements OnModuleInit {
         if (event.sequence !== cursor + 1)
           throw new ConflictException('Пропуск в событиях чата');
         const recipient = await client.query(
-          'SELECT id FROM guest_sessions WHERE id=$1 AND inquiry_id=$2',
+          'SELECT id FROM reply_routes WHERE id=$1 AND inquiry_id=$2',
           [event.guestSessionId, inquiryId],
         );
         if (!recipient.rowCount)
@@ -579,6 +726,11 @@ export class InquiriesService implements OnModuleInit {
               "INSERT INTO assignment_events(id,inquiry_id,user_id,reason) VALUES($1,$2,$3,'first_reply')",
               [randomUUID(), inquiryId, event.senderId],
             );
+          await client.query(
+            "INSERT INTO channel_outbox(id,inquiry_id,route_id) SELECT $1,$2,$3 WHERE EXISTS(SELECT 1 FROM reply_routes WHERE id=$3 AND channel<>'widget') ON CONFLICT(id) DO NOTHING",
+            [messageId, inquiryId, sessionId],
+          );
+          outgoing.push(messageId);
         }
         if (messageId) await this.publish(client, sessionId, messageId);
         cursor = event.sequence;
@@ -588,5 +740,6 @@ export class InquiriesService implements OnModuleInit {
         cursor,
       ]);
     });
+    for (const id of outgoing) await this.queue.enqueue('channel-outbox', id);
   }
 }

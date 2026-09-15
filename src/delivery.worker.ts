@@ -74,7 +74,7 @@ export class DeliveryWorker implements OnModuleInit, OnModuleDestroy {
       const message = (await db.query('SELECT * FROM messages WHERE id=$1', [job.id]))
         .rows[0];
       const session = (
-        await db.query('SELECT source FROM guest_sessions WHERE id=$1', [
+        await db.query('SELECT source FROM reply_routes WHERE id=$1', [
           message.session_id,
         ])
       ).rows[0];

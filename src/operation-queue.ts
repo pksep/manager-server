@@ -15,7 +15,16 @@ import {
 import { CONFIG, type Config } from './config';
 import { Database } from './database';
 
-export type OperationKind = 'delivery' | 'erp';
+const operationTables = {
+  delivery: 'delivery_operations',
+  erp: 'erp_sync_operations',
+  'channel-inbox': 'channel_inbox',
+  'channel-outbox': 'channel_outbox',
+} as const;
+
+export type OperationKind = keyof typeof operationTables;
+
+const operationKinds = Object.keys(operationTables) as OperationKind[];
 type Handler = (id: string) => Promise<'done' | 'retry'>;
 
 /** RabbitMQ доставляет задания, БД сохраняет намерение и результат для восстановления после сбоя публикации. */
@@ -108,7 +117,7 @@ export class OperationQueue implements OnModuleInit, OnModuleDestroy {
       this.publisher = undefined;
       void connection.close().catch(() => {});
     });
-    for (const kind of ['delivery', 'erp'] as const) {
+    for (const kind of operationKinds) {
       const queue = this.queue(kind);
       await publisher.assertQueue(`${queue}.failed`, {
         durable: true,
@@ -241,7 +250,7 @@ export class OperationQueue implements OnModuleInit, OnModuleDestroy {
   async enqueue(kind: OperationKind, id: string): Promise<void> {
     try {
       await this.publish(kind, id);
-      const table = kind === 'delivery' ? 'delivery_operations' : 'erp_sync_operations';
+      const table = operationTables[kind];
       await this.database.query(
         `UPDATE ${table} SET queued_until=now()+interval '60 seconds' WHERE id=$1`,
         [id],
@@ -256,9 +265,9 @@ export class OperationQueue implements OnModuleInit, OnModuleDestroy {
     if (this.recovering || !this.publisher || this.stopped) return;
     this.recovering = true;
     try {
-      for (const kind of ['delivery', 'erp'] as const) {
+      for (const kind of operationKinds) {
         if (!this.handlers.has(kind)) continue;
-        const table = kind === 'delivery' ? 'delivery_operations' : 'erp_sync_operations';
+        const table = operationTables[kind];
         const rows = await this.database.query<{ id: string }>(
           `SELECT id FROM ${table} WHERE ((state='pending' AND next_attempt_at<=now()) OR (state='working' AND locked_until<now())) AND (queued_until IS NULL OR queued_until<now()) ORDER BY next_attempt_at,id LIMIT 100`,
         );

@@ -102,6 +102,7 @@ export class ErpSyncService implements OnModuleInit {
   async candidates(inquiryId: string, actorId: string) {
     const customer = await this.customer(inquiryId);
     const erpActor = await this.inquiries.chat.erpActor(actorId);
+    if (!customer.contacts.phone && !customer.contacts.email) return [];
     return z
       .array(
         z.object({

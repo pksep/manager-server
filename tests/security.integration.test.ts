@@ -193,7 +193,7 @@ beforeAll(async () => {
   }
   db = new Database(config);
   await db.migrate();
-  for (let version = 7; version > 0; version--) await db.migrate('down');
+  for (let version = 8; version > 0; version--) await db.migrate('down');
   expect((await db.migrate('status')).executed).toEqual([]);
   await db.migrate();
   await new Promise<void>((resolve) => upstream.listen(4504, '127.0.0.1', resolve));
@@ -210,7 +210,7 @@ afterAll(async () => {
   await new Promise<void>((resolve) => upstream.close(() => resolve()));
   const connection = await connect(original.MANAGER_RABBITMQ_URL!);
   const channel = await connection.createChannel();
-  for (const kind of ['delivery', 'erp'])
+  for (const kind of ['delivery', 'erp', 'channel-inbox', 'channel-outbox'])
     for (const suffix of ['', '.retry', '.failed'])
       await channel.deleteQueue(`${prefix}.${kind}${suffix}`);
   await connection.close();
@@ -223,8 +223,8 @@ afterAll(async () => {
 });
 
 test('полный цикл up/down и повторное применение миграций; откат последней версии сохраняет записи', async () => {
-  expect((await db.migrate()).executed.length).toBe(7);
-  expect((await db.migrate('down')).pending).toEqual(['007_visitor_limits.sql']);
+  expect((await db.migrate()).executed.length).toBe(8);
+  expect((await db.migrate('down')).pending).toEqual(['008_channels.sql']);
   expect((await db.migrate()).pending).toEqual([]);
 });
 

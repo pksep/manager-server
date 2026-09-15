@@ -11,6 +11,7 @@ const files = [
   '005_customer_sessions.sql',
   '006_queue_delivery.sql',
   '007_visitor_limits.sql',
+  '008_channels.sql',
 ];
 
 export interface MigrationStatus {

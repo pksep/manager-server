@@ -17,12 +17,35 @@ import { FileInspection, SecureUploadInterceptor } from './secure-upload';
 import { OperationQueue } from './operation-queue';
 import { WidgetSettings } from './widget-settings';
 import { RetentionWorker } from './retention';
+import { ChannelController } from './channels/controller';
+import { ChannelService } from './channels/service';
+import {
+  ChannelHttp,
+  CHANNEL_TRANSPORT,
+  nativeChannelTransport,
+  type ChannelTransport,
+} from './channels/http-client';
+import { ChannelFiles } from './channels/files';
+import { VkAdapter } from './channels/vk';
+import { AvitoAdapter } from './channels/avito';
 
-export async function createApplication(config: Config) {
+export async function createApplication(
+  config: Config,
+  testOptions?: { channelTransport: ChannelTransport },
+) {
   @Module({
-    controllers: [HealthController, WidgetController, StaffController],
+    controllers: [HealthController, WidgetController, StaffController, ChannelController],
     providers: [
       { provide: CONFIG, useValue: config },
+      {
+        provide: CHANNEL_TRANSPORT,
+        useValue: testOptions?.channelTransport || nativeChannelTransport,
+      },
+      ChannelHttp,
+      ChannelFiles,
+      VkAdapter,
+      AvitoAdapter,
+      ChannelService,
       Database,
       OperationQueue,
       WidgetSettings,
@@ -64,7 +87,11 @@ export async function createApplication(config: Config) {
   });
   const security = app.get(SecurityService);
   app.use((request: Request, response: Response, next: NextFunction): void => {
-    if (!request.path.startsWith('/v1/widget')) return next();
+    if (
+      !request.path.startsWith('/v1/widget') &&
+      !request.path.startsWith('/v1/channels/')
+    )
+      return next();
     void Promise.resolve()
       .then(() => security.ingress(security.context(request)))
       .then(() => next())

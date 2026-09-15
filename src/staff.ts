@@ -23,6 +23,7 @@ import { z } from 'zod';
 import { InquiriesService } from './inquiries.service';
 import type { Request } from 'express';
 import { ErpSyncService } from './erp-sync.service';
+import { ChannelService } from './channels/service';
 
 type StaffRequest = Request & { actorId: string };
 @Injectable()
@@ -51,7 +52,63 @@ export class StaffController {
   constructor(
     @Inject(InquiriesService) private readonly inquiries: InquiriesService,
     @Inject(ErpSyncService) private readonly erp: ErpSyncService,
+    @Inject(ChannelService) private readonly channels: ChannelService,
   ) {}
+
+  /** Доступные адресаты ответа не содержат секретов подключений. */
+  @Get('inquiries/:id/routes')
+  routes(@Param('id', ParseUUIDPipe) id: string): Promise<unknown[]> {
+    return this.channels.routes(id);
+  }
+
+  /** Сервер Чата фиксирует проверенный маршрут до создания сообщения. */
+  @Post('inquiries/:id/reply-route')
+  replyRoute(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: unknown,
+  ): Promise<{ id: string; source: Record<string, unknown> }> {
+    const input = z.object({ routeId: z.uuid() }).strict().parse(body);
+    return this.channels.replyRoute(id, input.routeId);
+  }
+
+  /** Показывает менеджеру фактический результат отправки во внешнюю платформу. */
+  @Get('inquiries/:id/channel-deliveries')
+  async channelDeliveries(@Param('id', ParseUUIDPipe) id: string): Promise<unknown[]> {
+    return (
+      await this.inquiries.database.query(
+        `SELECT o.id,o.route_id,o.state,o.last_error,o.sending_part,o.updated_at,r.channel,jsonb_path_exists(o.progress,'$[*].confirmedBy') AS confirmed_by_manager FROM channel_outbox o JOIN reply_routes r ON r.id=o.route_id WHERE o.inquiry_id=$1 ORDER BY o.created_at DESC LIMIT 100`,
+        [id],
+      )
+    ).rows;
+  }
+
+  /** Повторяет выбранный ответ с сохранением подтверждённых частей. */
+  @Post('inquiries/:id/channel-deliveries/retry')
+  async retryChannel(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: unknown,
+  ): Promise<{ ok: true }> {
+    const input = z
+      .object({ messageId: z.uuid(), checkedOriginalChat: z.boolean().default(false) })
+      .strict()
+      .parse(body);
+    await this.channels.retry(id, input.messageId, input.checkedOriginalChat);
+    return { ok: true };
+  }
+
+  @Post('inquiries/:id/channel-deliveries/confirm')
+  async confirmChannel(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: unknown,
+    @Req() request: StaffRequest,
+  ): Promise<{ ok: true }> {
+    const input = z
+      .object({ messageId: z.uuid(), checkedOriginalChat: z.literal(true) })
+      .strict()
+      .parse(body);
+    await this.channels.confirmPart(id, input.messageId, request.actorId);
+    return { ok: true };
+  }
 
   /** Показывает совпадения с ЕРП для явного выбора менеджером. */
   @Get('inquiries/:id/erp/candidates')
@@ -81,6 +138,7 @@ export class StaffController {
     return (
       await this.inquiries.database.query(
         `SELECT i.*,c.name,c.contacts,c.erp_contact_id,
+      (SELECT array_agg(DISTINCT r.channel) FROM reply_routes r WHERE r.inquiry_id=i.id) AS channels,
       (SELECT count(*)::int FROM delivery_operations d WHERE d.inquiry_id=i.id AND d.state='failed') AS failed_deliveries
       FROM inquiries i JOIN customers c ON c.id=i.customer_id WHERE i.merged_into IS NULL ORDER BY i.created_at DESC,i.id DESC LIMIT 100 OFFSET $1`,
         [(page - 1) * 100],
@@ -100,7 +158,7 @@ export class StaffController {
     if (!inquiry) throw new NotFoundException('Обращение не найдено');
     const messages = (
       await this.inquiries.database.query(
-        'SELECT m.*,d.state AS delivery_state FROM messages m LEFT JOIN delivery_operations d ON d.id=m.id WHERE m.inquiry_id=$1 ORDER BY m.sequence LIMIT 500',
+        'SELECT m.*,COALESCE(o.state,d.state) AS delivery_state FROM messages m LEFT JOIN delivery_operations d ON d.id=m.id LEFT JOIN channel_outbox o ON o.id=m.id WHERE m.inquiry_id=$1 ORDER BY m.sequence LIMIT 500',
         [id],
       )
     ).rows;

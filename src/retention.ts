@@ -69,6 +69,13 @@ export class RetentionWorker implements OnModuleInit, OnModuleDestroy {
       "DELETE FROM guest_sessions WHERE id IN (SELECT g.id FROM guest_sessions g WHERE g.expires_at<now()-interval '1 day' AND g.inquiry_id IS NULL AND NOT EXISTS(SELECT 1 FROM attachments a WHERE a.session_id=g.id) AND NOT EXISTS(SELECT 1 FROM inquiries i WHERE i.session_id=g.id) AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.session_id=g.id) AND NOT EXISTS(SELECT 1 FROM widget_events e WHERE e.session_id=g.id) LIMIT 100)",
     );
     await db.query("DELETE FROM rate_buckets WHERE window_start<now()-interval '1 day'");
+    await db.query(
+      "DELETE FROM reply_routes WHERE id IN (SELECT r.id FROM reply_routes r WHERE r.channel='widget' AND r.inquiry_id IS NULL AND NOT EXISTS(SELECT 1 FROM guest_sessions g WHERE g.id=r.id) AND NOT EXISTS(SELECT 1 FROM attachments a WHERE a.session_id=r.id) LIMIT 100)",
+    );
+    // Сохраняем ключи дедупликации, убирая лишнюю копию содержимого доставленных уведомлений.
+    await db.query(
+      "UPDATE channel_inbox SET payload='{}',normalized=NULL WHERE id IN (SELECT id FROM channel_inbox WHERE state='delivered' AND updated_at<now()-interval '7 days' AND payload<>'{}'::jsonb LIMIT 100)",
+    );
   }
 
   /** После аварийного завершения убирает только собственные временные каталоги старше суток. */
