@@ -1,5 +1,6 @@
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const contexts = await Promise.all(
   [1, 2, 3].map(() => browser.newContext({ viewport: { width: 1440, height: 1000 } })),
@@ -15,6 +16,23 @@ for (const page of [staff1, staff2, visitor]) {
 }
 const customer = 'Тест виджета ' + Date.now().toString().slice(-6);
 try {
+  // На полном стенде ЕРП используется штатная авторизация. Оба менеджера
+  // имеют одинаковое право «Чат → Клиенты»; отсутствие доступа проверяют API-тесты.
+  if (process.env.MANAGER_ERP_LOGIN_FILE) {
+    const login = JSON.parse(readFileSync(process.env.MANAGER_ERP_LOGIN_FILE, 'utf8'));
+    for (const context of contexts.slice(0, 2)) {
+      const erp = await context.newPage();
+      await erp.goto('http://127.0.0.3:4315/');
+      await erp
+        .getByPlaceholder('Введите табельный номер', { exact: true })
+        .fill(login.tabel, { timeout: 60000 });
+      await erp.getByPlaceholder('Введите табельный номер', { exact: true }).press('Tab');
+      await erp.locator('input[type="password"]').fill(login.password);
+      await erp.getByTestId('LoginForm-Login-Button').click();
+      await erp.locator('.main-layout #nav').waitFor({ timeout: 60000 });
+      await erp.close();
+    }
+  }
   await staff1.goto('http://127.0.0.2:4312/', { waitUntil: 'domcontentloaded' });
   console.log('Открыт первый менеджер.');
   await staff1.locator('.chat').first().waitFor({ timeout: 60000 });
@@ -238,15 +256,20 @@ try {
   assert.equal(metrics.label, '14px');
   assert.equal(metrics.right, metrics.viewport);
   assert.equal(metrics.standardModal, true);
+  const secondErpPopupPromise = contexts[1].waitForEvent('page');
   await staff2.locator('[data-testid="Client-ErpButton"]').click();
-  await staff2
-    .getByText(
-      'Нет доступа к синхронизации СЭП или не настроена связь сотрудника с ЕРП.',
-      { exact: true },
-    )
-    .waitFor();
+  const secondErpPopup = await secondErpPopupPromise;
+  await secondErpPopup
+    .getByText('Создание нового контакта', { exact: true })
+    .waitFor({ timeout: 60000 });
+  assert.equal(
+    await secondErpPopup.getByPlaceholder('Введите ФИО', { exact: true }).inputValue(),
+    customer,
+  );
+  await secondErpPopup.close();
+  assert.equal((await getInquiry(staff2)).inquiry.erp_contact_id, null);
   assert.equal(await staff2.locator('[data-testid$="MenuBottomNav-Clients"]').count(), 1);
-  console.log('PASS: отсутствие права ЕРП не завершает сеанс менеджера чата.');
+  console.log('PASS: второй менеджер открывает форму ЕРП; закрытие не создаёт контакт.');
   const erpPopupPromise = contexts[0].waitForEvent('page');
   await staff1.locator('[data-testid="Client-ErpButton"]').click();
   const erpPopup = await erpPopupPromise;
