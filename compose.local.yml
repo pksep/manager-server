@@ -1,0 +1,45 @@
+name: sep-manager-local
+services:
+  clamav:
+    image: clamav/clamav:stable
+    ports: ['127.0.0.1:53310:3310']
+    volumes: ['clamav:/var/lib/clamav', './config/clamd.conf:/etc/clamav/clamd.conf:ro']
+    mem_limit: 2g
+    cpus: 1
+  redis:
+    image: redis:8-alpine
+    ports: ['127.0.0.1:56394:6379']
+  rabbitmq:
+    image: rabbitmq:4-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: manager-local
+      RABBITMQ_DEFAULT_PASS: ${LOCAL_POSTGRES_PASSWORD:?Run bun run local:setup}
+      RABBITMQ_DEFAULT_VHOST: manager-service
+    ports: ['127.0.0.1:55675:5672']
+    volumes: ['rabbitmq:/var/lib/rabbitmq']
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: manager_local
+      POSTGRES_USER: manager_local
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:?Run bun run local:setup}
+    ports: ['127.0.0.1:56441:5432']
+    volumes: ['postgres:/var/lib/postgresql']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U manager_local -d manager_local']
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: manager-local
+      MINIO_ROOT_PASSWORD: ${LOCAL_MINIO_PASSWORD:?Run bun run local:setup}
+    ports: ['127.0.0.1:59008:9000', '127.0.0.1:59009:9001']
+    volumes: ['minio:/data']
+volumes:
+  clamav:
+  rabbitmq:
+  postgres:
+  minio:

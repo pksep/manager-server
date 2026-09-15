@@ -1,0 +1,21 @@
+[
+  {
+    "id": "amotiv-demo",
+    "name": "Локальная проверка Амотив",
+    "origins": ["http://127.0.0.1:4310"],
+    "widgetOrigins": ["http://127.0.0.1:4310", "http://127.0.0.1:4312"],
+    "config": {
+      "company": { "name": "НПО Амотив" },
+      "welcomeMessages": ["Здравствуйте!", "Мне нужна помощь", "Вы можете мне помочь?"],
+      "socialLinks": [],
+      "schedule": {
+        "timezone": "Europe/Moscow",
+        "start": "08:00",
+        "end": "18:00",
+        "days": [1, 2, 3, 4, 5]
+      },
+      "contactPolicy": "all",
+      "limits": { "fileBytes": 10485760, "fileCount": 5, "messageChars": 10000 }
+    }
+  }
+]

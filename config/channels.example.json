@@ -1,0 +1,22 @@
+[
+  {
+    "id": "vk-company",
+    "platform": "vk",
+    "name": "Компания ВКонтакте",
+    "accountId": "123456",
+    "enabled": false,
+    "webhookSecretEnv": "MANAGER_VK_WEBHOOK_SECRET",
+    "tokenEnv": "MANAGER_VK_TOKEN",
+    "confirmationEnv": "MANAGER_VK_CONFIRMATION"
+  },
+  {
+    "id": "avito-company",
+    "platform": "avito",
+    "name": "Компания Авито",
+    "accountId": "123456",
+    "enabled": false,
+    "webhookSecretEnv": "MANAGER_AVITO_WEBHOOK_SECRET",
+    "clientIdEnv": "MANAGER_AVITO_CLIENT_ID",
+    "clientSecretEnv": "MANAGER_AVITO_CLIENT_SECRET"
+  }
+]
