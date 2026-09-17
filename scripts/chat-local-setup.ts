@@ -35,7 +35,7 @@ const values = {
   APPLICATION_TYPE: 'test',
   DATABASE_URL: url.toString(),
   REDIS_URL: 'redis://127.0.0.1:56394',
-  RABBITMQ_URL: `amqp://manager-local:${env.LOCAL_POSTGRES_PASSWORD}@127.0.0.1:55675`,
+  RABBITMQ_URL: `amqp://manager-local:${env.LOCAL_POSTGRES_PASSWORD}@127.0.0.1:55675/manager-service`,
   JWT_SECRET: env.CHAT_JWT_SECRET,
   PRIVATE_KEY: env.CHAT_JWT_SECRET,
   ADMIN_PASSWORD: env.CHAT_JWT_SECRET,
@@ -66,6 +66,13 @@ const values = {
   VITE_AUTH_API: 'http://127.0.0.1:4502',
   VITE_ERP_URL: 'http://127.0.0.1:4502',
   VITE_MASTRA_URL: 'http://127.0.0.1:4503',
+  ...(env.ERP_MANAGER_KEY
+    ? {
+        MANAGER_ERP_ACCESS_URL:
+          'http://127.0.0.1:4503/api/internal/manager/access',
+        MANAGER_ERP_ACCESS_KEY: env.ERP_MANAGER_KEY,
+      }
+    : {}),
   ALLOWED_ORIGIN: 'http://127.0.0.1:4310,http://127.0.0.1:5173',
 };
 mkdirSync(resolve(chatRoot, 'env'), { recursive: true });
