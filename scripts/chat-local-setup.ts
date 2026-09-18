@@ -35,7 +35,7 @@ const values = {
   APPLICATION_TYPE: 'test',
   DATABASE_URL: url.toString(),
   REDIS_URL: 'redis://127.0.0.1:56394',
-  RABBITMQ_URL: `amqp://manager-local:${env.LOCAL_POSTGRES_PASSWORD}@127.0.0.1:55675/manager-service`,
+  RABBITMQ_URL: `amqp://manager-local:${env.LOCAL_POSTGRES_PASSWORD}@127.0.0.1:45675/manager-service`,
   JWT_SECRET: env.CHAT_JWT_SECRET,
   PRIVATE_KEY: env.CHAT_JWT_SECRET,
   ADMIN_PASSWORD: env.CHAT_JWT_SECRET,

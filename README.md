@@ -64,7 +64,7 @@ bun --env-file=.env.local run migrate
 `local:setup` создаёт `.env.local` со случайными локальными ключами и сохраняет
 существующий файл без перезаписи. `local:chat` принимает путь к другому клону
 чата дополнительным аргументом. Базы, контейнеры и порты изолированы от прочих
-проектов: PostgreSQL 56441, Redis 56394 (manager — DB 14), RabbitMQ 55675
+проектов: PostgreSQL 56441, Redis 56394 (manager — DB 14), RabbitMQ 45675
 (manager — vhost `manager-service`), S3 59008/59009, ClamAV 53310.
 Секреты остаются в игнорируемых локальных файлах.
 

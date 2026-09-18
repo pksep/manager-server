@@ -21,7 +21,7 @@ services:
       RABBITMQ_DEFAULT_USER: manager-local
       RABBITMQ_DEFAULT_PASS: ${LOCAL_POSTGRES_PASSWORD:?Run bun run local:setup}
       RABBITMQ_DEFAULT_VHOST: manager-service
-    ports: ['127.0.0.1:55675:5672']
+    ports: ['127.0.0.1:45675:5672']
     volumes: ['rabbitmq:/var/lib/rabbitmq']
   postgres:
     image: postgres:18-alpine
