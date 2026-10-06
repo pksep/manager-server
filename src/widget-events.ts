@@ -81,8 +81,14 @@ export function attachWidgetEvents(
               if (message.type === 'authenticate' && !state && !authenticating) {
                 authenticating = true;
                 const guest = await inquiries.guest(message.token, origin);
+                const support = inquiries.config.sites.some(
+                  (site) => site.id === guest.site_id && !!site.support,
+                );
                 guestLease = await inquiries.security.acquire([
-                  { key: `ws-guest:${guest.id}`, capacity: 3 },
+                  {
+                    key: `ws-guest:${guest.id}`,
+                    capacity: support ? inquiries.config.MANAGER_WS_IP_CONCURRENCY : 3,
+                  },
                 ]);
                 await inquiries.ready();
                 const snapshot = await inquiries.database.transaction(async (client) => {

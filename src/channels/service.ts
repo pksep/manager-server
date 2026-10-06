@@ -577,9 +577,9 @@ export class ChannelService implements OnModuleInit {
   /** Список маршрутов содержит только данные для выбора адресата, без внешних ключей. */
   async routes(inquiryId: string): Promise<unknown[]> {
     const rows = await this.db.query<
-      ReplyRoute & { enabled: boolean; expires_at: Date | null }
+      ReplyRoute & { enabled: boolean; expires_at: Date | null; support_active: boolean }
     >(
-      `SELECT r.*,COALESCE(c.enabled,true) AS enabled,g.expires_at FROM reply_routes r LEFT JOIN channel_connections c ON c.id=r.connection_id LEFT JOIN guest_sessions g ON g.id=r.id WHERE r.inquiry_id=$1 ORDER BY last_inbound_at DESC,id`,
+      `SELECT r.*,COALESCE(c.enabled,true) AS enabled,g.expires_at,COALESCE(s.enabled,false) AS support_active FROM reply_routes r LEFT JOIN channel_connections c ON c.id=r.connection_id LEFT JOIN guest_sessions g ON g.id=r.id LEFT JOIN support_clients sc ON sc.guest_session_id=r.id LEFT JOIN sites s ON s.id=sc.site_id WHERE r.inquiry_id=$1 ORDER BY last_inbound_at DESC,id`,
       [inquiryId],
     );
     return rows.rows.map((route) => ({
@@ -591,6 +591,7 @@ export class ChannelService implements OnModuleInit {
       canReply:
         route.enabled &&
         (route.channel !== 'widget' ||
+          route.support_active ||
           (!!route.expires_at && route.expires_at > new Date())),
       capabilities: capabilities[route.channel],
     }));
@@ -612,7 +613,7 @@ export class ChannelService implements OnModuleInit {
     else if (
       !(
         await this.db.query(
-          'SELECT id FROM guest_sessions WHERE id=$1 AND expires_at>now()',
+          'SELECT g.id FROM guest_sessions g WHERE g.id=$1 AND (g.expires_at>now() OR EXISTS(SELECT 1 FROM support_clients sc JOIN sites s ON s.id=sc.site_id WHERE sc.guest_session_id=g.id AND s.enabled))',
           [routeId],
         )
       ).rowCount
