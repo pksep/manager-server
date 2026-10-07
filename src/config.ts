@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
-import { SiteSchema } from './contracts';
+import { SiteSchema, type Site } from './contracts';
 import { securitySettingsSchema } from './security-config';
 import { readChannels } from './channels/config';
 
@@ -33,7 +33,13 @@ const settingsSchema = z.object({
   MANAGER_WORKER_MS: z.coerce.number().int().min(100).max(60000).default(1000),
   VK_BUSINESS_URL: z.url().optional(),
 });
-export function readConfig(env: NodeJS.ProcessEnv = process.env) {
+export interface Config extends z.infer<typeof settingsSchema> {
+  sites: Site[];
+  supportKeys: Record<string, string>;
+  channels: ReturnType<typeof readChannels>;
+}
+
+export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const parsed = settingsSchema.safeParse(env);
   if (!parsed.success)
     throw new Error(
@@ -120,11 +126,31 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     ];
   if (new Set(sites.map((site) => site.id)).size !== sites.length)
     throw new Error('Идентификаторы сайтов должны быть уникальными');
+
+  const supportKeys: Record<string, string> = {};
+
+  for (const site of sites) {
+    if (!site.support) continue;
+
+    const key = env[site.support.keyEnv];
+
+    if (
+      !key ||
+      key.length < 32 ||
+      key.startsWith('REPLACE_') ||
+      site.widgetOrigins.length !== 1 ||
+      supportKeys[site.support.clientId]
+    )
+      throw new Error('Проверьте ключ, уникальность клиента и адрес виджета поддержки');
+
+    supportKeys[site.support.clientId] = key;
+  }
+
   return {
     ...settings,
     sites,
+    supportKeys,
     channels: readChannels(settings.MANAGER_CHANNELS_PATH, env),
   };
 }
-export type Config = ReturnType<typeof readConfig>;
 export const CONFIG = Symbol('manager.config');

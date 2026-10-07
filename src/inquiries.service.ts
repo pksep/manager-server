@@ -91,7 +91,7 @@ export class InquiriesService implements OnModuleInit {
   ) {}
   async onModuleInit() {
     const version = await this.database.query(
-      'SELECT version FROM manager_schema_migrations WHERE version=8',
+      'SELECT version FROM manager_schema_migrations WHERE version=9',
     );
     if (!version.rowCount) throw new Error('Сначала примените миграции manager');
     for (const site of this.config.sites)
@@ -141,6 +141,10 @@ export class InquiriesService implements OnModuleInit {
   async session(body: unknown, origin: string, token: string, context: SecurityContext) {
     const input = SessionRequestSchema.parse(body),
       site = this.site(input.siteId);
+
+    if (site.support && !token)
+      throw new ForbiddenException('Откройте поддержку из приложения клиента');
+
     const pageUrl = new URL(input.source.pageUrl);
     if (!site.widgetOrigins.includes(origin) || !site.origins.includes(pageUrl.origin))
       throw new ForbiddenException('Источник не разрешён');

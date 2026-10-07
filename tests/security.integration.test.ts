@@ -193,7 +193,7 @@ beforeAll(async () => {
   }
   db = new Database(config);
   await db.migrate();
-  for (let version = 8; version > 0; version--) await db.migrate('down');
+  for (let version = 9; version > 0; version--) await db.migrate('down');
   expect((await db.migrate('status')).executed).toEqual([]);
   await db.migrate();
   await new Promise<void>((resolve) => upstream.listen(4504, '127.0.0.1', resolve));
@@ -223,8 +223,8 @@ afterAll(async () => {
 });
 
 test('полный цикл up/down и повторное применение миграций; откат последней версии сохраняет записи', async () => {
-  expect((await db.migrate()).executed.length).toBe(8);
-  expect((await db.migrate('down')).pending).toEqual(['008_channels.sql']);
+  expect((await db.migrate()).executed.length).toBe(9);
+  expect((await db.migrate('down')).pending).toEqual(['009_support_clients.sql']);
   expect((await db.migrate()).pending).toEqual([]);
 });
 

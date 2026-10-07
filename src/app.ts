@@ -28,13 +28,20 @@ import {
 import { ChannelFiles } from './channels/files';
 import { VkAdapter } from './channels/vk';
 import { AvitoAdapter } from './channels/avito';
+import { SupportController, SupportService } from './support';
 
 export async function createApplication(
   config: Config,
   testOptions?: { channelTransport: ChannelTransport },
 ) {
   @Module({
-    controllers: [HealthController, WidgetController, StaffController, ChannelController],
+    controllers: [
+      HealthController,
+      WidgetController,
+      StaffController,
+      ChannelController,
+      SupportController,
+    ],
     providers: [
       { provide: CONFIG, useValue: config },
       {
@@ -59,6 +66,7 @@ export async function createApplication(
       SecurityService,
       FileInspection,
       SecureUploadInterceptor,
+      SupportService,
     ],
   })
   class ManagerModule {}

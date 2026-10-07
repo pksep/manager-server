@@ -61,6 +61,32 @@ export class ChatAdapter {
     const result = await (await this.request('/ready')).json();
     z.object({ ready: z.literal(true), version: z.literal(1) }).parse(result);
   }
+
+  /** Создаёт постоянную переписку тем же путём, что доставка обычного обращения. */
+  async ensureInquiry(input: {
+    id: string;
+    session_id: string;
+    customer_id: string;
+    source: Record<string, unknown>;
+    customerName: string;
+  }): Promise<{ topicId: string }> {
+    return z.object({ topicId: z.uuid() }).parse(
+      await (
+        await this.request(`/inquiries/${input.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            version: 1,
+            guestSessionId: input.session_id,
+            customerId: input.customer_id,
+            customerName: input.customerName,
+            source: input.source,
+          }),
+        })
+      ).json(),
+    );
+  }
+
   async deliver(
     inquiry: {
       id: string;

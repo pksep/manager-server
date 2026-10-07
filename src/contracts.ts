@@ -69,6 +69,14 @@ export const SiteSchema = z.object({
   origins: z.array(origin).min(1),
   widgetOrigins: z.array(origin).min(1),
   enabled: z.boolean().default(true),
+  support: z
+    .object({
+      clientId: identifier,
+      name: z.string().trim().min(2).max(100),
+      keyEnv: z.string().regex(/^[A-Z][A-Z0-9_]{2,99}$/),
+    })
+    .strict()
+    .optional(),
   config: WidgetConfigSchema,
 });
 export type Site = z.infer<typeof SiteSchema>;
