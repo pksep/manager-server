@@ -152,3 +152,13 @@ export const ChatEventSchema = z.object({
   readAt: z.iso.datetime().optional(),
 });
 export type ChatEvent = z.infer<typeof ChatEventSchema>;
+
+export const OperatorTypingSchema = z.object({
+  id: z.uuid(),
+  inquiryId: z.uuid(),
+  guestSessionId: z.uuid(),
+  startedAt: z.iso.datetime(),
+  expiresAt: z.iso.datetime(),
+});
+
+export type OperatorTyping = z.infer<typeof OperatorTypingSchema>;

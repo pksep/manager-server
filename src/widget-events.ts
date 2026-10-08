@@ -1,7 +1,23 @@
 import { WebSocketServer, WebSocket } from 'ws';
-import type { Server } from 'node:http';
+import type { IncomingMessage, Server } from 'node:http';
+import type { Duplex } from 'node:stream';
 import type { Guest, InquiriesService, MessageRow } from './inquiries.service';
 import { presentMessage } from './inquiries.service';
+
+interface WidgetSession {
+  guest: Guest;
+  cursor: string;
+  running: boolean;
+  lastPingAt: number;
+  lastSeenAt: number;
+  lastHeartbeatAt: number;
+  heartbeatId?: string;
+  renewing: boolean;
+  inquiryId: string | null;
+  lastTypingCheckAt: number;
+  typingRunning: boolean;
+  typingId?: string;
+}
 
 /** Подписка ограничена одной сессией; снимок и курсор читаются под общей блокировкой. */
 export function attachWidgetEvents(
@@ -9,15 +25,12 @@ export function attachWidgetEvents(
   inquiries: InquiriesService,
 ): () => void {
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 8192 });
-  const sessions = new Map<
-    WebSocket,
-    { guest: Guest; cursor: string; running: boolean; lastPingAt: number }
-  >();
-  const upgrade: Parameters<Server['on']>[1] = async (
-    request: any,
-    socket: any,
-    head: any,
-  ) => {
+  const sessions = new Map<WebSocket, WidgetSession>();
+  const upgrade = async (
+    request: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+  ): Promise<void> => {
     if (
       new URL(request.url || '/', 'http://localhost').pathname !== '/v1/widget/events'
     ) {
@@ -63,6 +76,38 @@ export function attachWidgetEvents(
           void connectionLease.release().catch(() => {});
           void guestLease?.release().catch(() => {});
         };
+
+        async function renew(state: WidgetSession): Promise<void> {
+          if (state.guest.expires_at.getTime() <= Date.now())
+            throw new Error('Сессия истекла');
+
+          inquiries.site(state.guest.site_id);
+          await inquiries.ready();
+
+          if (!(await connectionLease.renew()) || !(await guestLease?.renew()))
+            throw new Error('Подключение истекло');
+
+          if (sessions.get(ws) === state && ws.readyState === WebSocket.OPEN)
+            state.lastSeenAt = Date.now();
+        }
+
+        // На протокольный ping браузер отвечает сам, даже без таймеров страницы.
+        ws.on('pong', (raw): void => {
+          const state = sessions.get(ws);
+
+          if (!state || !state.heartbeatId || String(raw) !== state.heartbeatId) return;
+
+          state.heartbeatId = undefined;
+          if (state.renewing) return;
+
+          state.renewing = true;
+          void renew(state)
+            .catch(() => ws.close(1011, 'Соединение недоступно'))
+            .finally(() => {
+              state.renewing = false;
+            });
+        });
+
         const timeout = setTimeout(() => ws.terminate(), 5000);
         ws.on('error', () => {
           sessions.delete(ws);
@@ -127,6 +172,12 @@ export function attachWidgetEvents(
                   cursor: snapshot.cursor,
                   running: false,
                   lastPingAt: Date.now(),
+                  lastSeenAt: Date.now(),
+                  lastHeartbeatAt: Date.now(),
+                  renewing: false,
+                  inquiryId: snapshot.inquiryId,
+                  lastTypingCheckAt: 0,
+                  typingRunning: false,
                 });
                 clearTimeout(timeout);
                 ws.send(
@@ -140,12 +191,7 @@ export function attachWidgetEvents(
                 if (Date.now() - state.lastPingAt < 1000)
                   throw new Error('Слишком частые запросы');
                 state.lastPingAt = Date.now();
-                if (!(await connectionLease.renew()) || !(await guestLease?.renew()))
-                  throw new Error('Подключение истекло');
-                if (state.guest.expires_at.getTime() <= Date.now())
-                  throw new Error('Сессия истекла');
-                inquiries.site(state.guest.site_id);
-                await inquiries.ready();
+                await renew(state);
                 ws.send(
                   JSON.stringify({
                     type: 'pong',
@@ -170,30 +216,73 @@ export function attachWidgetEvents(
     for (const [ws, state] of sessions) {
       if (ws.readyState !== WebSocket.OPEN) continue;
       if (
-        Date.now() - state.lastPingAt > 60000 ||
+        Date.now() - state.lastSeenAt > 60000 ||
         state.guest.expires_at.getTime() <= Date.now() ||
         ws.bufferedAmount > 2 * 1024 * 1024
       ) {
         ws.terminate();
         continue;
       }
+
+      if (!state.heartbeatId && Date.now() - state.lastHeartbeatAt >= 20000) {
+        state.heartbeatId = crypto.randomUUID();
+        state.lastHeartbeatAt = Date.now();
+        ws.ping(state.heartbeatId);
+      }
+
+      if (
+        state.inquiryId &&
+        !state.typingRunning &&
+        Date.now() - state.lastTypingCheckAt >= 1000
+      ) {
+        const inquiryId = state.inquiryId;
+        state.lastTypingCheckAt = Date.now();
+        state.typingRunning = true;
+        void inquiries.chat
+          .typing(inquiryId, state.guest.id)
+          .then((typing): void => {
+            if (
+              sessions.get(ws) !== state ||
+              state.inquiryId !== inquiryId ||
+              ws.readyState !== WebSocket.OPEN
+            )
+              return;
+
+            if (
+              typing &&
+              typing.id !== state.typingId &&
+              Date.parse(typing.expiresAt) > Date.now()
+            ) {
+              ws.send(JSON.stringify({ type: 'typing', ...typing }));
+              state.typingId = typing.id;
+            }
+          })
+          .catch(() => {
+            // Сбой необязательного сигнала не прерывает доставку сообщений.
+          })
+          .finally(() => {
+            state.typingRunning = false;
+          });
+      }
+
       if (state.running) continue;
       state.running = true;
       void inquiries.database
-        .query(
+        .query<MessageRow & { event_sequence: string }>(
           'SELECT e.sequence AS event_sequence,m.* FROM widget_events e JOIN messages m ON m.id=e.message_id WHERE e.session_id=$1 AND e.sequence>$2 ORDER BY e.sequence LIMIT 100',
           [state.guest.id, state.cursor],
         )
-        .then((result) => {
+        .then((result): void => {
           for (const row of result.rows) {
             if (ws.readyState !== WebSocket.OPEN) break;
             ws.send(
               JSON.stringify({
                 type: 'message',
-                message: presentMessage(row as any),
+                message: presentMessage(row),
               }),
             );
             state.cursor = String(row.event_sequence);
+            state.inquiryId = String(row.inquiry_id);
           }
         })
         .catch(() => ws.close(1011, 'Связь с хранилищем потеряна'))

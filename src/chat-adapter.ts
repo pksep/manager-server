@@ -13,11 +13,37 @@ import {
   AttachmentSchema,
   ChatEventSchema,
   ChatReceiptSchema,
+  OperatorTypingSchema,
+  type OperatorTyping,
   type Contacts,
 } from './contracts';
 
 @Injectable()
 export class ChatAdapter {
+  /** Читает временное начало набора только для конкретной гостевой сессии. */
+  async typing(
+    inquiryId: string,
+    guestSessionId: string,
+  ): Promise<OperatorTyping | null> {
+    const result = z
+      .object({ typing: OperatorTypingSchema.nullable() })
+      .parse(
+        await (
+          await this.request(`/inquiries/${inquiryId}/typing/${guestSessionId}`)
+        ).json(),
+      );
+
+    if (
+      result.typing &&
+      (result.typing.inquiryId !== inquiryId ||
+        result.typing.guestSessionId !== guestSessionId)
+    ) {
+      throw new ServiceUnavailableException('Некорректный адресат набора сообщения');
+    }
+
+    return result.typing;
+  }
+
   /** Проверяет право сотрудника по тому же источнику, что использует СЭП Чат. */
   async assertManager(id: string) {
     await this.request(`/managers/${encodeURIComponent(id)}/access`);
