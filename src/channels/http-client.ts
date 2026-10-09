@@ -4,6 +4,7 @@ import { request as httpsRequest } from 'node:https';
 import { Readable } from 'node:stream';
 import ipaddr from 'ipaddr.js';
 import { ChannelError, type Platform } from './contracts';
+import { pinnedLookup } from './pinned-lookup';
 
 export type ChannelTransport = (url: URL, init: RequestInit) => Promise<Response>;
 
@@ -33,8 +34,7 @@ export const nativeChannelTransport: ChannelTransport = async (
         headers,
         signal: init.signal || undefined,
         family: address.family,
-        lookup: (_host, _options, callback): void =>
-          callback(null, address.address, address.family),
+        lookup: pinnedLookup(address),
       },
       (response) => {
         const resultHeaders = new Headers();
