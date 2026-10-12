@@ -18,6 +18,13 @@ import {
   type Contacts,
 } from './contracts';
 
+/** Сохраняет только HTTP-статус, не раскрывая ответ Чата или ключ интеграции. */
+export class ChatRequestFailed extends ServiceUnavailableException {
+  constructor(readonly remoteStatus?: number) {
+    super('Нет связи с СЭП Чатом');
+  }
+}
+
 @Injectable()
 export class ChatAdapter {
   /** Читает временное начало набора только для конкретной гостевой сессии. */
@@ -61,10 +68,11 @@ export class ChatAdapter {
   }
   constructor(@Inject(CONFIG) private readonly config: Config) {}
   /** Все обращения к чату остаются серверными; гостевой токен здесь не используется. */
-  async request(path: string, init: RequestInit = {}) {
+  async request(path: string, init: RequestInit = {}): Promise<Response> {
     try {
       const headers = new Headers(init.headers);
       headers.set('x-manager-key', this.config.CHAT_MANAGER_KEY);
+
       const response = await fetch(
         `${this.config.CHAT_SERVICE_URL.replace(/\/$/, '')}/internal/manager${path}`,
         {
@@ -74,13 +82,17 @@ export class ChatAdapter {
           redirect: 'error',
         },
       );
+
       if (response.status === 403)
         throw new ForbiddenException('У сотрудника нет доступа к обращениям');
-      if (!response.ok) throw new Error(`chat_http_${response.status}`);
+      if (!response.ok) throw new ChatRequestFailed(response.status);
+
       return response;
     } catch (error) {
-      if (error instanceof ForbiddenException) throw error;
-      throw new ServiceUnavailableException('Нет связи с СЭП Чатом');
+      if (error instanceof ForbiddenException || error instanceof ChatRequestFailed)
+        throw error;
+
+      throw new ChatRequestFailed();
     }
   }
   async ready() {
@@ -122,7 +134,7 @@ export class ChatAdapter {
       contacts: Contacts;
     },
     message: { id: string; html: string; attachmentIds: string[] },
-  ) {
+  ): Promise<z.infer<typeof ChatReceiptSchema>> {
     return ChatReceiptSchema.parse(
       await (
         await this.request(`/inquiries/${inquiry.id}/messages`, {
