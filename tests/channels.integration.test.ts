@@ -132,7 +132,7 @@ const transport: ChannelTransport = async (url, init) => {
     const match = /\/chats\/([^/]+)/.exec(url.pathname);
     const chatId = match ? decodeURIComponent(match[1]) : '';
     if (init.method === 'GET' && url.pathname.includes('/messages/'))
-      return reply([fixtures.get(chatId)]);
+      return reply({ messages: [fixtures.get(chatId)], meta: {} });
     if (init.method === 'GET' && match)
       return reply({
         id: chatId,

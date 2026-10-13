@@ -38,6 +38,11 @@ const messageSchema = z.object({
   content: contentSchema,
 });
 
+/** V3 возвращает страницу сообщений в объекте; meta не является сообщением. */
+const messagesPageSchema = z.object({
+  messages: z.array(messageSchema).max(100),
+});
+
 @Injectable()
 export class AvitoAdapter {
   private readonly tokens = new Map<string, { value: string; expiresAt: number }>();
@@ -132,15 +137,16 @@ export class AvitoAdapter {
     const path = `/accounts/${encodeURIComponent(connection.accountId)}/chats/${encodeURIComponent(value.chat_id)}`;
     let message: z.infer<typeof messageSchema> | undefined;
     for (let offset = 0; offset <= 1000; offset += 100) {
-      const messages = z
-        .array(messageSchema)
-        .max(100)
-        .parse(
-          await this.call(
-            connection,
-            `/messenger/v3${path}/messages/?limit=100&offset=${offset}`,
-          ),
-        );
+      const response = await this.call(
+        connection,
+        `/messenger/v3${path}/messages/?limit=100&offset=${offset}`,
+      );
+
+      // Старый формат массива сохраняет ту же строгую проверку каждого элемента.
+      const messages = messagesPageSchema.parse(
+        Array.isArray(response) ? { messages: response } : response,
+      ).messages;
+
       message = messages.find((item) => item.id === value.id);
       if (message || messages.length < 100) break;
     }
