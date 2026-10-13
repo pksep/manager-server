@@ -19,6 +19,7 @@
     "test:support": "bun run build && bun test tests/support.integration.test.ts --timeout 30000",
     "test:erp": "bun run build && bun --env-file=.env.local test tests/erp.integration.test.ts --timeout 30000",
     "test:channels": "bun run build && bun --env-file=.env.local test tests/channels.integration.test.ts --timeout 60000",
+    "test:avito": "bun run build && bun test tests/avito.integration.test.ts --timeout 90000",
     "channels:check": "bun scripts/channels.ts check",
     "channels:subscribe": "bun scripts/channels.ts subscribe",
     "channels:status": "bun scripts/channels.ts status",
