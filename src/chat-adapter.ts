@@ -14,6 +14,7 @@ import {
   ChatEventSchema,
   ChatReceiptSchema,
   OperatorTypingSchema,
+  customerDisplayName,
   type OperatorTyping,
   type Contacts,
 } from './contracts';
@@ -145,7 +146,7 @@ export class ChatAdapter {
             operationId: message.id,
             guestSessionId: inquiry.session_id,
             customerId: inquiry.customer_id,
-            customerName: inquiry.contacts.name,
+            customerName: customerDisplayName(inquiry.contacts),
             source: inquiry.source,
             html: message.html,
             attachmentIds: message.attachmentIds,

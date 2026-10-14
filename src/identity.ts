@@ -2,23 +2,20 @@ import { BadRequestException, ConflictException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { DatabaseTransaction } from './database';
 import { domainToASCII } from 'node:url';
-import type { Contacts, WidgetConfig } from './contracts';
+import { customerDisplayName, type Contacts, type WidgetConfig } from './contracts';
 
-/** Нормализует реквизиты для поиска кандидатов, не подтверждая личность посетителя. */
+/** Старые политики принимают любой один контакт; нормализация не подтверждает личность. */
 export function normalizeContacts(
   contacts: Contacts,
-  policy: WidgetConfig['contactPolicy'],
-) {
+  _policy: WidgetConfig['contactPolicy'],
+): { phone: string; email: string } {
   const phone = contacts.phone.replace(/\D/g, '');
   if (
-    (contacts.phone || policy === 'all') &&
+    contacts.phone &&
     (!/^[+\d\s().-]+$/.test(contacts.phone) || phone.length < 10 || phone.length > 15)
   )
     throw new BadRequestException('Проверьте номер телефона');
-  if (
-    (contacts.email || policy === 'all') &&
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contacts.email)
-  )
+  if (contacts.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contacts.email))
     throw new BadRequestException('Проверьте email');
   if (!contacts.phone && !contacts.email)
     throw new BadRequestException('Укажите телефон или email');
@@ -27,6 +24,7 @@ export function normalizeContacts(
   const email = domain
     ? `${local.toLocaleLowerCase('en-US')}@${domainToASCII(domain.toLocaleLowerCase('en-US'))}`
     : '';
+
   return { phone: phone ? `+${phone}` : '', email };
 }
 
@@ -55,7 +53,7 @@ export async function resolveCustomer(
   }
   const id = randomUUID();
   await client.models.Customer.create(
-    { id, name: contacts.name, contacts },
+    { id, name: customerDisplayName(contacts), contacts },
     { transaction: client.transaction },
   );
   return id;
