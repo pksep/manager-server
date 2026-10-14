@@ -27,6 +27,16 @@ export class ChatRequestFailed extends ServiceUnavailableException {
 
 @Injectable()
 export class ChatAdapter {
+  /** Получает полный текущий список сотрудников с правом работы с клиентами. */
+  async managerIds(): Promise<string[]> {
+    const snapshot = z
+      .object({ userIds: z.array(z.uuid()).max(100000) })
+      .strict()
+      .parse(await (await this.request('/managers')).json());
+
+    return snapshot.userIds;
+  }
+
   /** Читает временное начало набора только для конкретной гостевой сессии. */
   async typing(
     inquiryId: string,
