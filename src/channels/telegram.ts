@@ -291,16 +291,34 @@ export class TelegramAdapter {
     chatId: string,
     file: Express.Multer.File,
   ): Promise<string> {
-    const photo = ['image/jpeg', 'image/png'].includes(file.mimetype);
-    const url = new URL(this.address(connection, photo ? 'sendPhoto' : 'sendDocument'));
-    url.searchParams.set('chat_id', chatId);
-    const result = await this.files.upload(
-      'telegram',
-      url.href,
-      photo ? 'photo' : 'document',
-      file,
-    );
+    const send = async (photo: boolean): Promise<string> => {
+      const url = new URL(this.address(connection, photo ? 'sendPhoto' : 'sendDocument'));
+      url.searchParams.set('chat_id', chatId);
+      const result = await this.files.upload(
+        'telegram',
+        url.href,
+        photo ? 'photo' : 'document',
+        file,
+      );
 
-    return this.messageId(this.result(result, true));
+      return this.messageId(this.result(result, true));
+    };
+    const photo =
+      ['image/jpeg', 'image/png'].includes(file.mimetype) &&
+      file.size <= 10 * 1024 * 1024;
+
+    try {
+      return await send(photo);
+    } catch (error) {
+      // Telegram ограничивает также пропорции фото. Явный отказ 400 не создаёт сообщения.
+      if (
+        photo &&
+        error instanceof ChannelError &&
+        ['CHANNEL_HTTP_400', 'TELEGRAM_HTTP_400'].includes(error.code)
+      )
+        return send(false);
+
+      throw error;
+    }
   }
 }

@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +14,7 @@ import {
 import { ChannelFiles } from '../../src/channels/files';
 import { TelegramAdapter } from '../../src/channels/telegram';
 import { MaxAdapter } from '../../src/channels/max';
+import { ChannelError } from '../../src/channels/contracts';
 
 const telegram: ChannelConnection = {
   id: 'telegram-company',
@@ -340,6 +341,45 @@ test('Telegram возвращает ID отправки без HTML-размет
   }).telegram;
 
   expect(await bot.send(telegram, '100', '<текст>')).toBe('42');
+});
+
+test('крупное фото и фото с неподдерживаемыми пропорциями уходят в Telegram как документ', async (): Promise<void> => {
+  const urls: string[] = [];
+  const upload = spyOn(ChannelFiles.prototype, 'upload').mockImplementation(
+    async (_platform, address): Promise<unknown> => {
+      urls.push(new URL(address).pathname.split('/').at(-1)!);
+
+      if (address.includes('/sendPhoto')) throw new ChannelError('CHANNEL_HTTP_400');
+
+      return { ok: true, result: { message_id: 5 } };
+    },
+  );
+  const stream = Readable.from([]);
+  const file: Express.Multer.File = {
+    fieldname: 'file',
+    originalname: 'photo.png',
+    encoding: '7bit',
+    mimetype: 'image/png',
+    size: 11 * 1024 * 1024,
+    path: 'unused',
+    destination: '',
+    filename: 'photo.png',
+    stream,
+    buffer: Buffer.alloc(0),
+  };
+
+  try {
+    const bot = adapters(async (): Promise<Response> => {
+      throw new Error('Сеть не нужна');
+    }).telegram;
+
+    expect(await bot.sendFile(telegram, '100', file)).toBe('5');
+    expect(await bot.sendFile(telegram, '100', { ...file, size: 100 })).toBe('5');
+    expect(urls).toEqual(['sendDocument', 'sendPhoto', 'sendDocument']);
+  } finally {
+    upload.mockRestore();
+    stream.destroy();
+  }
 });
 
 test('429 повторяется с задержкой, MAX attachment.not.ready не означает отправку', async (): Promise<void> => {
