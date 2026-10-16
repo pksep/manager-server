@@ -29,6 +29,8 @@ import {
 import { VkAdapter, VkMessageSchema } from './vk';
 import { AvitoAdapter, AvitoWebhookSchema } from './avito';
 import { ChannelFiles } from './files';
+import { TelegramAdapter, TelegramUpdateSchema } from './telegram';
+import { MaxAdapter, MaxUpdateSchema, type MaxUpload } from './max';
 
 interface Job {
   id: string;
@@ -45,6 +47,8 @@ interface Job {
 }
 
 type Table = 'channel_inbox' | 'channel_outbox';
+
+type OutboundPart = { text: string } | { file: Attachment };
 
 /** Не превращает HTML-разметку менеджера в видимые теги во внешней переписке. */
 export function channelText(html: string): string {
@@ -92,6 +96,8 @@ export class ChannelService implements OnModuleInit {
     @Inject(ChannelFiles) private readonly files: ChannelFiles,
     @Inject(VkAdapter) private readonly vk: VkAdapter,
     @Inject(AvitoAdapter) private readonly avito: AvitoAdapter,
+    @Inject(TelegramAdapter) private readonly telegram: TelegramAdapter,
+    @Inject(MaxAdapter) private readonly max: MaxAdapter,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -175,7 +181,7 @@ export class ChannelService implements OnModuleInit {
         return 'ok';
       eventKey = `${object.message.peer_id}:${object.message.conversation_message_id}`;
       payload = { type: event.type, object };
-    } else {
+    } else if (connection.platform === 'avito') {
       if (body && typeof body === 'object' && Object.keys(body).length === 0) return 'ok';
       const event = AvitoWebhookSchema.parse(body);
       if (event.payload.value.user_id !== connection.accountId)
@@ -183,6 +189,16 @@ export class ChannelService implements OnModuleInit {
       if (event.payload.value.author_id === connection.accountId) return 'ok';
       eventKey = `${event.payload.value.chat_id}:${event.payload.value.id}`;
       payload = event;
+    } else {
+      payload =
+        connection.platform === 'telegram'
+          ? TelegramUpdateSchema.parse(body)
+          : MaxUpdateSchema.parse(body);
+      const message = await this.incoming(connection, payload);
+
+      if (!message) return 'ok';
+
+      eventKey = `${message.conversationId}:${message.messageId}`;
     }
     const prior = (
       await this.db.query<{ id: string }>(
@@ -324,14 +340,25 @@ export class ChannelService implements OnModuleInit {
     return connection;
   }
 
+  private async incoming(
+    connection: ChannelConnection,
+    payload: unknown,
+  ): Promise<IncomingMessage | null> {
+    switch (connection.platform) {
+      case 'vk':
+        return this.vk.incoming(connection, payload);
+      case 'avito':
+        return this.avito.incoming(connection, payload);
+      case 'telegram':
+        return this.telegram.incoming(connection, payload);
+      case 'max':
+        return this.max.incoming(connection, payload);
+    }
+  }
+
   private async receiveJob(job: Job): Promise<void> {
     const connection = this.configured(job.connection_id!);
-    const message =
-      job.normalized ||
-      (await (connection.platform === 'vk' ? this.vk : this.avito).incoming(
-        connection,
-        job.payload,
-      ));
+    const message = job.normalized || (await this.incoming(connection, job.payload));
     if (!message) return;
     if (!job.normalized)
       await this.db.query(
@@ -360,13 +387,18 @@ export class ChannelService implements OnModuleInit {
     const attachments: string[] = [];
     for (const file of message.files) {
       try {
-        const attachment = await this.files.receive(connection.platform, file, (upload) =>
+        const use = (
+          upload: Express.Multer.File,
+        ): ReturnType<InquiriesService['uploadForRoute']> =>
           this.inquiries.uploadForRoute(
             route,
             `channel:${hash(`${job.id}:${file.id}`)}`,
             upload,
-          ),
-        );
+          );
+        const attachment =
+          connection.platform === 'telegram'
+            ? await this.telegram.receive(connection, file, use)
+            : await this.files.receive(connection.platform, file, use);
         attachments.push(attachment.id);
       } catch (error) {
         if (
@@ -447,11 +479,15 @@ export class ChannelService implements OnModuleInit {
       throw new ChannelError('CHANNEL_ROUTE_NOT_FOUND');
     const connection = this.configured(route.connection_id);
     if (
-      connection.platform === 'avito' &&
+      connection.platform !== 'vk' &&
       job.sending_part !== null &&
       job.sending_part !== undefined
     )
-      throw new ChannelError('AVITO_DELIVERY_UNCONFIRMED', false, true);
+      throw new ChannelError(
+        `${connection.platform.toUpperCase()}_DELIVERY_UNCONFIRMED`,
+        false,
+        true,
+      );
     const message = (
       await this.db.query<{ html: string; attachments: Attachment[] }>(
         'SELECT html,attachments FROM messages WHERE id=$1 AND session_id=$2',
@@ -460,7 +496,7 @@ export class ChannelService implements OnModuleInit {
     ).rows[0];
     if (!message) throw new ChannelError('CHANNEL_MESSAGE_NOT_FOUND');
     const progress = job.progress || [];
-    const parts: Array<{ text: string } | { file: Attachment }> = textParts(
+    const parts: OutboundPart[] = textParts(
       channelText(message.html),
       capabilities[connection.platform].textChars,
     ).map((text) => ({ text }));
@@ -477,62 +513,56 @@ export class ChannelService implements OnModuleInit {
       if (progress.some((part) => part.index === index)) continue;
       await assertLease();
       const part = parts[index];
-      let attachmentId: string | undefined;
-      if ('file' in part) {
-        const response = await this.inquiries.chat.download(part.file.id, route.id);
-        attachmentId = await this.files
-          .fromResponse(
-            response,
-            part.file.name,
-            part.file.mime,
-            async (upload) => {
-              await this.inspection.inspect(
-                upload.path,
-                upload.originalname,
-                upload.size,
-                upload.mimetype,
-              );
-              return connection.platform === 'vk'
-                ? this.vk.upload(connection, route.external_chat_id!, upload)
-                : this.avito.upload(connection, upload);
-            },
-            part.file.size,
-          )
-          .catch((error: unknown) => {
-            // Загрузка файла ещё не отправляет сообщение: её можно безопасно повторять.
-            if (error instanceof ChannelError)
-              throw new ChannelError(
-                error.code,
-                error.retryable,
-                false,
-                error.retryAfter,
-              );
-            throw error;
-          });
-      }
-      await assertLease();
-      await this.db.query(
-        'UPDATE channel_outbox SET sending_part=$3 WHERE id=$1 AND lease_token=$2',
-        [job.id, job.lease_token, index],
-      );
+      let sending = false;
+      const beginSend = async (): Promise<void> => {
+        if (connection.platform === 'max' || connection.platform === 'telegram') {
+          await this.security
+            .consume([
+              {
+                key: `channel:${connection.id}:send`,
+                capacity: connection.platform === 'max' ? 30 : 25,
+                window: 1000,
+              },
+              {
+                key: `channel:${connection.id}:send:${route.external_chat_id}`,
+                capacity: connection.platform === 'max' ? 2 : 1,
+                window: 1000,
+              },
+            ])
+            .catch(() => {
+              throw new ChannelError('CHANNEL_SEND_RATE_LIMITED', true, false, 1);
+            });
+        }
+
+        await assertLease();
+        const marked = await this.db.query(
+          "UPDATE channel_outbox SET sending_part=$3 WHERE id=$1 AND lease_token=$2 AND state='working' AND locked_until>now() RETURNING id",
+          [job.id, job.lease_token, index],
+        );
+
+        if (!marked.rowCount) throw new ChannelError('CHANNEL_LEASE_LOST', true);
+
+        sending = true;
+      };
       let externalId: string;
+
       try {
-        externalId =
-          connection.platform === 'vk'
-            ? await this.vk.send(
-                connection,
-                route.external_chat_id,
-                'text' in part ? part.text : '',
-                attachmentId ? [attachmentId] : [],
-                job.random_id! * 1024 + index,
-              )
-            : await this.avito.send(
-                connection,
-                route.external_chat_id,
-                'text' in part ? part.text : '',
-                attachmentId,
-              );
+        externalId = await this.sendPart(
+          connection,
+          route,
+          part,
+          job.random_id! * 1024 + index,
+          beginSend,
+        );
       } catch (error) {
+        if (!sending) {
+          // Получение и загрузка файла до начала отправки не создают сообщения клиенту.
+          if (error instanceof ChannelError)
+            throw new ChannelError(error.code, error.retryable, false, error.retryAfter);
+
+          throw error;
+        }
+
         if (
           connection.platform === 'vk' ||
           (error instanceof ChannelError && !error.uncertain)
@@ -544,8 +574,12 @@ export class ChannelService implements OnModuleInit {
           if (error instanceof ChannelError)
             throw new ChannelError(error.code, error.retryable, false, error.retryAfter);
         }
-        if (connection.platform === 'avito')
-          throw new ChannelError('AVITO_DELIVERY_UNCONFIRMED', false, true);
+        if (connection.platform !== 'vk')
+          throw new ChannelError(
+            `${connection.platform.toUpperCase()}_DELIVERY_UNCONFIRMED`,
+            false,
+            true,
+          );
         throw error;
       }
       progress.push({ index, externalId });
@@ -559,7 +593,7 @@ export class ChannelService implements OnModuleInit {
             throw new ChannelError(
               'CHANNEL_LEASE_LOST',
               true,
-              connection.platform === 'avito',
+              connection.platform !== 'vk',
             );
           await transaction.query(
             'INSERT INTO channel_message_receipts(connection_id,external_chat_id,external_message_id,message_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',
@@ -567,11 +601,88 @@ export class ChannelService implements OnModuleInit {
           );
         })
         .catch((error: unknown) => {
-          if (connection.platform === 'avito')
-            throw new ChannelError('AVITO_DELIVERY_UNCONFIRMED', false, true);
+          if (connection.platform !== 'vk')
+            throw new ChannelError(
+              `${connection.platform.toUpperCase()}_DELIVERY_UNCONFIRMED`,
+              false,
+              true,
+            );
           throw error;
         });
     }
+  }
+
+  private async sendPart(
+    connection: ChannelConnection,
+    route: ReplyRoute,
+    part: OutboundPart,
+    randomId: number,
+    beginSend: () => Promise<void>,
+  ): Promise<string> {
+    const chatId = route.external_chat_id!;
+    const send = async (attachment?: string | MaxUpload): Promise<string> => {
+      await beginSend();
+      const text = 'text' in part ? part.text : '';
+
+      switch (connection.platform) {
+        case 'vk':
+          return this.vk.send(
+            connection,
+            chatId,
+            text,
+            typeof attachment === 'string' ? [attachment] : [],
+            randomId,
+          );
+        case 'avito':
+          return this.avito.send(
+            connection,
+            chatId,
+            text,
+            typeof attachment === 'string' ? attachment : undefined,
+          );
+        case 'telegram':
+          return this.telegram.send(connection, chatId, text);
+        case 'max':
+          return this.max.send(
+            connection,
+            chatId,
+            text,
+            typeof attachment === 'object' ? attachment : undefined,
+          );
+      }
+    };
+
+    if ('text' in part) return send();
+
+    const response = await this.inquiries.chat.download(part.file.id, route.id);
+
+    return this.files.fromResponse(
+      response,
+      part.file.name,
+      part.file.mime,
+      async (upload): Promise<string> => {
+        await this.inspection.inspect(
+          upload.path,
+          upload.originalname,
+          upload.size,
+          upload.mimetype,
+        );
+
+        switch (connection.platform) {
+          case 'telegram':
+            await beginSend();
+
+            return this.telegram.sendFile(connection, chatId, upload);
+          case 'vk':
+            return send(await this.vk.upload(connection, chatId, upload));
+          case 'avito':
+            return send(await this.avito.upload(connection, upload));
+          case 'max':
+            return send(await this.max.upload(connection, upload));
+        }
+      },
+      part.file.size,
+    );
   }
 
   /** Список маршрутов содержит только данные для выбора адресата, без внешних ключей. */

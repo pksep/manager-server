@@ -18,5 +18,23 @@
     "webhookSecretEnv": "MANAGER_AVITO_WEBHOOK_SECRET",
     "clientIdEnv": "MANAGER_AVITO_CLIENT_ID",
     "clientSecretEnv": "MANAGER_AVITO_CLIENT_SECRET"
+  },
+  {
+    "id": "telegram-company",
+    "platform": "telegram",
+    "name": "Компания в Telegram",
+    "accountId": "123456",
+    "enabled": false,
+    "webhookSecretEnv": "MANAGER_TELEGRAM_WEBHOOK_SECRET",
+    "tokenEnv": "MANAGER_TELEGRAM_TOKEN"
+  },
+  {
+    "id": "max-company",
+    "platform": "max",
+    "name": "Компания в MAX",
+    "accountId": "123456",
+    "enabled": false,
+    "webhookSecretEnv": "MANAGER_MAX_WEBHOOK_SECRET",
+    "tokenEnv": "MANAGER_MAX_TOKEN"
   }
 ]

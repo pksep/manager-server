@@ -21,6 +21,8 @@ export class ChannelFiles {
     file: IncomingFile,
     use: (upload: Express.Multer.File) => Promise<T>,
   ): Promise<T> {
+    if (!file.url) throw new ChannelError('CHANNEL_ADDRESS_DENIED');
+
     if (file.size !== undefined && (file.size < 1 || file.size > maximum))
       throw new ChannelError('CHANNEL_FILE_TOO_LARGE');
     let address = file.url;
@@ -40,7 +42,28 @@ export class ChannelFiles {
           response.status >= 500 || response.status === 429,
         );
       }
-      return this.fromResponse(response, file.name, file.mime, use, file.size);
+      const responseMime = response.headers
+        .get('content-type')
+        ?.split(';')[0]
+        .toLowerCase();
+      const imageExtensions: Record<string, string> = {
+        'image/jpeg': 'jpg',
+        'image/png': 'png',
+        'image/gif': 'gif',
+        'image/webp': 'webp',
+      };
+      const extension = responseMime ? imageExtensions[responseMime] : undefined;
+      // MAX не передаёт MIME и имя изображения в событии. Содержимое всё равно проверит FileInspection.
+      const inferImage =
+        platform === 'max' && file.mime.startsWith('image/') && extension;
+
+      return this.fromResponse(
+        response,
+        inferImage ? `${file.name.replace(/\.[^.]*$/, '')}.${extension}` : file.name,
+        inferImage ? responseMime! : file.mime,
+        use,
+        file.size,
+      );
     }
     throw new ChannelError('CHANNEL_FILE_REDIRECT');
   }
@@ -148,6 +171,41 @@ export class ChannelFiles {
     } finally {
       source.destroy();
       stream.destroy();
+    }
+  }
+
+  /** MAX выдаёт для документов URL с токеном и принимает диапазон байтов, а не multipart. */
+  async uploadRange(address: string, file: Express.Multer.File): Promise<void> {
+    const source = createReadStream(file.path);
+    const stream = Readable.toWeb(source) as ReadableStream<Uint8Array>;
+
+    try {
+      const response = await this.http.request(
+        'max',
+        address,
+        {
+          method: 'POST',
+          body: stream,
+          headers: {
+            'Content-Type': 'application/x-binary',
+            'Content-Length': String(file.size),
+            'Content-Range': `bytes 0-${file.size - 1}/${file.size}`,
+            'Content-Disposition': `attachment; filename="${encodeURIComponent(file.originalname)}"`,
+            'X-File-Name': encodeURIComponent(file.originalname),
+            'X-Uploading-Mode': 'parallel',
+          },
+        },
+        false,
+      );
+      await response.body?.cancel();
+
+      if (!response.ok)
+        throw new ChannelError(
+          'MAX_UPLOAD_FAILED',
+          response.status === 429 || response.status >= 500,
+        );
+    } finally {
+      source.destroy();
     }
   }
 }
