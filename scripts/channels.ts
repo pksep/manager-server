@@ -4,6 +4,8 @@ import { ChannelHttp, nativeChannelTransport } from '../src/channels/http-client
 import { ChannelFiles } from '../src/channels/files';
 import { VkAdapter } from '../src/channels/vk';
 import { AvitoAdapter } from '../src/channels/avito';
+import { TelegramAdapter } from '../src/channels/telegram';
+import { MaxAdapter } from '../src/channels/max';
 import { ChannelError } from '../src/channels/contracts';
 import { Database } from '../src/database';
 import { z } from 'zod';
@@ -13,6 +15,8 @@ const http = new ChannelHttp(nativeChannelTransport);
 const files = new ChannelFiles(http);
 const vk = new VkAdapter(http, files);
 const avito = new AvitoAdapter(http, files);
+const telegram = new TelegramAdapter(http, files);
+const max = new MaxAdapter(http, files);
 const [command, connectionId, operationId] = process.argv.slice(2);
 const selected = config.channels.filter(
   (item) => item.enabled && (!connectionId || item.id === connectionId),
@@ -59,6 +63,8 @@ try {
           await vk.call(connection, 'groups.getById', {
             group_ids: connection.accountId,
           });
+        else if (connection.platform === 'telegram') await telegram.check(connection);
+        else if (connection.platform === 'max') await max.check(connection);
         else {
           const account = z
             .object({ id: z.number().int().positive() })
@@ -87,6 +93,13 @@ try {
             url: `${origin.origin}/v1/channels/avito/${connection.id}/${connection.webhookSecret}`,
           });
           console.info(`${connection.id}: подписка Авито зарегистрирована`);
+        } else if (connection.platform === 'telegram' || connection.platform === 'max') {
+          const adapter = connection.platform === 'telegram' ? telegram : max;
+          await adapter.subscribe(
+            connection,
+            `${origin.origin}/v1/channels/${connection.platform}/${connection.id}`,
+          );
+          console.info(`${connection.id}: подписка бота зарегистрирована`);
         } else {
           // Настройка ВК выполняется в управлении сообществом: токен сообщений может не иметь права администрирования Callback API.
           console.info(

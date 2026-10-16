@@ -21,6 +21,14 @@ const schema = z.discriminatedUnion('platform', [
     clientIdEnv: environmentKey,
     clientSecretEnv: environmentKey,
   }),
+  base.extend({
+    platform: z.literal('telegram'),
+    tokenEnv: environmentKey,
+  }),
+  base.extend({
+    platform: z.literal('max'),
+    tokenEnv: environmentKey,
+  }),
 ]);
 
 export type ChannelConnection = z.infer<typeof schema> & {
@@ -71,14 +79,16 @@ export function readChannels(
     return {
       ...connection,
       webhookSecret,
-      ...(connection.platform === 'vk'
+      ...(connection.platform === 'avito'
         ? {
-            token: credential(connection.tokenEnv),
-            confirmation: credential(connection.confirmationEnv),
-          }
-        : {
             clientId: credential(connection.clientIdEnv),
             clientSecret: credential(connection.clientSecretEnv),
+          }
+        : {
+            token: credential(connection.tokenEnv),
+            ...(connection.platform === 'vk'
+              ? { confirmation: credential(connection.confirmationEnv) }
+              : {}),
           }),
     };
   });

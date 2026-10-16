@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { Attachment, Contacts } from '../contracts';
 
-export const PlatformSchema = z.enum(['vk', 'avito']);
+export const PlatformSchema = z.enum(['vk', 'avito', 'telegram', 'max']);
 
 export type Platform = z.infer<typeof PlatformSchema>;
 
@@ -28,7 +28,9 @@ export interface ReplyRoute {
 
 export interface IncomingFile {
   id: string;
-  url: string;
+  url?: string;
+  /** Telegram file_id сохраняется без URL, содержащего токен бота. */
+  providerFileId?: string;
   name: string;
   mime: string;
   size?: number;
@@ -67,6 +69,19 @@ export interface ChannelCapabilities {
   readReceipts: boolean;
 }
 
+const documentMimeTypes = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'application/pdf',
+  'text/plain',
+  'text/csv',
+  'application/zip',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+];
+
 export const capabilities: Record<'widget' | Platform, ChannelCapabilities> = {
   widget: {
     textChars: 10000,
@@ -98,6 +113,20 @@ export const capabilities: Record<'widget' | Platform, ChannelCapabilities> = {
     fileBytes: 20 * 1024 * 1024,
     fileCount: 10,
     mimeTypes: ['image/jpeg', 'image/png', 'image/gif'],
+    readReceipts: false,
+  },
+  telegram: {
+    textChars: 4096,
+    fileBytes: 20 * 1024 * 1024,
+    fileCount: 10,
+    mimeTypes: documentMimeTypes,
+    readReceipts: false,
+  },
+  max: {
+    textChars: 4000,
+    fileBytes: 20 * 1024 * 1024,
+    fileCount: 10,
+    mimeTypes: documentMimeTypes,
     readReceipts: false,
   },
 };

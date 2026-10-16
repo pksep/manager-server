@@ -28,6 +28,8 @@ import {
 import { ChannelFiles } from './channels/files';
 import { VkAdapter } from './channels/vk';
 import { AvitoAdapter } from './channels/avito';
+import { TelegramAdapter } from './channels/telegram';
+import { MaxAdapter } from './channels/max';
 import { SupportController, SupportService } from './support';
 
 export async function createApplication(
@@ -52,6 +54,8 @@ export async function createApplication(
       ChannelFiles,
       VkAdapter,
       AvitoAdapter,
+      TelegramAdapter,
+      MaxAdapter,
       ChannelService,
       Database,
       OperationQueue,

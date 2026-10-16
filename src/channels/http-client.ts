@@ -96,18 +96,24 @@ export function assertPlatformUrl(
   } catch {
     throw new ChannelError('CHANNEL_ADDRESS_DENIED');
   }
-  const domains =
-    platform === 'vk'
-      ? [
-          'vk.com',
-          'vk.ru',
-          'userapi.com',
-          'vkuserphoto.ru',
-          'vkuseraudio.net',
-          'vk-cdn.net',
-          'vkuser.net',
-        ]
-      : ['avito.ru', 'avito.st', 'avito.com'];
+  const hosts: Record<Platform, { api: string; files: string[] }> = {
+    vk: {
+      api: 'api.vk.com',
+      files: [
+        'vk.com',
+        'vk.ru',
+        'userapi.com',
+        'vkuserphoto.ru',
+        'vkuseraudio.net',
+        'vk-cdn.net',
+        'vkuser.net',
+      ],
+    },
+    avito: { api: 'api.avito.ru', files: ['avito.ru', 'avito.st', 'avito.com'] },
+    telegram: { api: 'api.telegram.org', files: ['api.telegram.org'] },
+    max: { api: 'platform-api2.max.ru', files: ['max.ru', 'oneme.ru'] },
+  };
+  const allowed = hosts[platform];
   if (
     url.protocol !== 'https:' ||
     url.username ||
@@ -115,13 +121,44 @@ export function assertPlatformUrl(
     url.hash ||
     (url.port && url.port !== '443') ||
     (apiOnly
-      ? url.hostname !== (platform === 'vk' ? 'api.vk.com' : 'api.avito.ru')
-      : !domains.some(
+      ? url.hostname !== allowed.api
+      : !allowed.files.some(
           (domain) => url.hostname === domain || url.hostname.endsWith(`.${domain}`),
         ))
   )
     throw new ChannelError('CHANNEL_ADDRESS_DENIED');
   return url;
+}
+
+/** Ограничивает также ответы ботов, где описание ошибки может содержать секреты. */
+export async function readChannelJson(
+  response: Response,
+  uncertain = false,
+): Promise<unknown> {
+  if (!response.body) throw new ChannelError('CHANNEL_INVALID_RESPONSE', true, uncertain);
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      length += value.length;
+      if (length > 2 * 1024 * 1024) throw new Error();
+
+      chunks.push(value);
+    }
+
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+  } catch {
+    await reader.cancel().catch(() => {});
+    throw new ChannelError('CHANNEL_INVALID_RESPONSE', true, uncertain);
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 @Injectable()
@@ -171,23 +208,6 @@ export class ChannelHttp {
         seconds,
       );
     }
-    if (!response.body)
-      throw new ChannelError('CHANNEL_INVALID_RESPONSE', true, init.method === 'POST');
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let length = 0;
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        length += value.length;
-        if (length > 2 * 1024 * 1024) throw new Error();
-        chunks.push(value);
-      }
-      return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
-    } catch {
-      await reader.cancel().catch(() => {});
-      throw new ChannelError('CHANNEL_INVALID_RESPONSE', true, init.method === 'POST');
-    }
+    return readChannelJson(response, init.method === 'POST');
   }
 }
