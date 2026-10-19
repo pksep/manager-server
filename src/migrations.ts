@@ -14,6 +14,7 @@ const files = [
   '008_channels.sql',
   '009_support_clients.sql',
   '010_telegram_max.sql',
+  '011_erp_contact_refresh.sql',
 ];
 
 export interface MigrationStatus {
