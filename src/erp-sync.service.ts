@@ -11,6 +11,34 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { InquiriesService } from './inquiries.service';
 import type { Contacts } from './contracts';
+import { ErpContactSnapshotSchema, erpContactProfile } from './erp-contact-profile';
+
+interface ErpDependencies {
+  database: InquiriesService['database'];
+  config: Pick<InquiriesService['config'], 'ERP_SERVICE_URL' | 'ERP_MANAGER_KEY'>;
+  chat: Pick<InquiriesService['chat'], 'erpActor'>;
+  queue: Pick<InquiriesService['queue'], 'register' | 'enqueue'>;
+}
+
+interface Customer {
+  id: string;
+  name: string;
+  contacts: Contacts;
+  erp_contact_id: string | null;
+}
+
+interface PublicErpJob {
+  id: string;
+  customerId: string;
+  state: string;
+}
+
+const CandidateSchema = z.object({
+  id: z.number().int().positive(),
+  initial: z.string(),
+  ban: z.boolean(),
+  requisites: z.array(z.unknown()),
+});
 
 const command = z
   .object({
@@ -37,21 +65,23 @@ interface ErpJob {
 
 @Injectable()
 export class ErpSyncService implements OnModuleInit {
-  constructor(@Inject(InquiriesService) private readonly inquiries: InquiriesService) {}
+  constructor(@Inject(InquiriesService) private readonly inquiries: ErpDependencies) {}
 
   async onModuleInit(): Promise<void> {
     if (!this.inquiries.config.ERP_SERVICE_URL) return;
+    const migration = await this.inquiries.database.query(
+      'SELECT version FROM manager_schema_migrations WHERE version=11',
+    );
+
+    if (!migration.rowCount)
+      throw new Error('Сначала примените миграцию обновления контактов Manager');
+
     await this.inquiries.queue.register('erp', (id) => this.process(id));
   }
 
-  private async customer(inquiryId: string) {
+  private async customer(inquiryId: string): Promise<Customer> {
     const row = (
-      await this.inquiries.database.query<{
-        id: string;
-        name: string;
-        contacts: Contacts;
-        erp_contact_id: string | null;
-      }>(
+      await this.inquiries.database.query<Customer>(
         'SELECT c.* FROM customers c JOIN inquiries i ON i.customer_id=c.id WHERE i.id=$1',
         [inquiryId],
       )
@@ -59,13 +89,13 @@ export class ErpSyncService implements OnModuleInit {
     if (!row) throw new NotFoundException('Обращение не найдено');
     return row;
   }
-  private identity(contacts: Contacts) {
+  private identity(contacts: Contacts): { phone?: string; email?: string } {
     return {
       ...(contacts.phone ? { phone: contacts.phone } : {}),
       ...(contacts.email ? { email: contacts.email } : {}),
     };
   }
-  private async request(actorId: number, path: string, body: unknown) {
+  private async request(actorId: number, path: string, body: unknown): Promise<unknown> {
     const { ERP_SERVICE_URL: base, ERP_MANAGER_KEY: key } = this.inquiries.config;
     if (!base || !key)
       throw new ServiceUnavailableException('Интеграция ЕРП не подключена');
@@ -99,26 +129,26 @@ export class ErpSyncService implements OnModuleInit {
     return response.json();
   }
   /** Получает совпадения по телефону/почте, не подтверждая личность клиента автоматически. */
-  async candidates(inquiryId: string, actorId: string) {
+  async candidates(
+    inquiryId: string,
+    actorId: string,
+  ): Promise<z.infer<typeof CandidateSchema>[]> {
     const customer = await this.customer(inquiryId);
     const erpActor = await this.inquiries.chat.erpActor(actorId);
     if (!customer.contacts.phone && !customer.contacts.email) return [];
     return z
-      .array(
-        z.object({
-          id: z.number().int().positive(),
-          initial: z.string(),
-          ban: z.boolean(),
-          requisites: z.array(z.unknown()),
-        }),
-      )
+      .array(CandidateSchema)
       .max(21)
       .parse(
         await this.request(erpActor, 'candidates', this.identity(customer.contacts)),
       );
   }
   /** Сохраняет намерение до запроса к ЕРП: перезапуск или потеря ответа не теряют операцию. */
-  async enqueue(inquiryId: string, actorId: string, body: unknown) {
+  async enqueue(
+    inquiryId: string,
+    actorId: string,
+    body: unknown,
+  ): Promise<PublicErpJob> {
     const input = command.parse(body);
     if (!this.inquiries.config.ERP_SERVICE_URL)
       throw new ServiceUnavailableException('Интеграция ЕРП не подключена');
@@ -150,14 +180,12 @@ export class ErpSyncService implements OnModuleInit {
       }
       const active = (
         await db.query<ErpJob>(
-          "SELECT * FROM erp_sync_operations WHERE customer_id=$1 AND state IN ('pending','working','completed')",
+          "SELECT * FROM erp_sync_operations WHERE customer_id=$1 AND state IN ('pending','working')",
           [customer.id],
         )
       ).rows[0];
       if (active) {
-        if (active.fingerprint !== fingerprint)
-          throw new ConflictException('Сначала завершите текущую синхронизацию');
-        return this.publicJob(active);
+        throw new ConflictException('Сначала завершите текущую синхронизацию');
       }
       if (
         current.erp_contact_id &&
@@ -165,12 +193,14 @@ export class ErpSyncService implements OnModuleInit {
         String(input.contactId) !== current.erp_contact_id
       )
         throw new ConflictException('Клиент уже связан с другим контактом');
+      const contactId = input.contactId || Number(current.erp_contact_id) || undefined;
       const payload = {
         operationId: input.operationId,
         customerId: customer.id,
         name: customer.name,
-        identity: this.identity(customer.contacts),
-        ...(input.contactId ? { contactId: input.contactId } : {}),
+        // Выбранная карточка читается по ID, старые реквизиты не являются её новым содержимым.
+        identity: contactId ? {} : this.identity(customer.contacts),
+        ...(contactId ? { contactId } : {}),
       };
       const job = (
         await db.query<ErpJob>(
@@ -183,23 +213,21 @@ export class ErpSyncService implements OnModuleInit {
     await this.inquiries.queue.enqueue('erp', result.id);
     return result;
   }
-  private publicJob(job: ErpJob) {
+  private publicJob(job: ErpJob): PublicErpJob {
     return { id: job.id, customerId: job.customer_id, state: job.state };
   }
 
   /** Возобновляет тот же запрос; исходный инициатор и параметры сохраняются. */
-  async retry(inquiryId: string, operationId: string) {
+  async retry(inquiryId: string, operationId: string): Promise<PublicErpJob> {
     const customer = await this.customer(inquiryId);
     const result = await this.inquiries.database.transaction(async (db) => {
       await db.query('SELECT id FROM customers WHERE id=$1 FOR UPDATE', [customer.id]);
       const active = await db.query(
-        "SELECT id FROM erp_sync_operations WHERE customer_id=$1 AND state IN ('pending','working','completed')",
+        "SELECT id FROM erp_sync_operations WHERE customer_id=$1 AND state IN ('pending','working')",
         [customer.id],
       );
       if (active.rowCount)
-        throw new ConflictException(
-          'У клиента уже есть выполняемая или завершённая синхронизация',
-        );
+        throw new ConflictException('У клиента уже есть выполняемая синхронизация');
       const job = (
         await db.query<ErpJob>(
           "UPDATE erp_sync_operations SET state='pending',attempts=0,next_attempt_at=now(),last_error=NULL WHERE id=$1 AND customer_id=$2 AND state='failed' RETURNING *",
@@ -246,15 +274,67 @@ export class ErpSyncService implements OnModuleInit {
           customerId: z.uuid(),
           contactId: z.number().int().positive(),
           created: z.boolean(),
+          contact: ErpContactSnapshotSchema,
         })
         .parse(await this.request(actor, 'sync', job.request));
       if (result.customerId !== job.customer_id) throw new Error('erp_contract_mismatch');
+      if (result.contact.id !== result.contactId)
+        throw new Error('erp_contract_mismatch');
+      if (result.contact.ban) throw new ConflictException('Контакт находится в архиве');
+      const profile = erpContactProfile(result.contact);
       await this.inquiries.database.transaction(async (db) => {
+        // Один контакт СЭП объединяет реквизиты и историю, но не каналы и сессии посетителей.
+        await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+          `manager:erp-contact:${result.contactId}`,
+        ]);
+        const newer = (
+          await db.query<{
+            contacts: Contacts;
+            erp_contact_updated_at: Date;
+            id: string;
+          }>(
+            `SELECT id,contacts,erp_contact_updated_at FROM customers
+           WHERE erp_contact_id=$1 AND erp_contact_updated_at>$2::timestamptz
+           ORDER BY erp_contact_updated_at DESC,id LIMIT 1 FOR UPDATE`,
+            [String(result.contactId), result.contact.updatedAt],
+          )
+        ).rows[0];
         const changed = await db.query(
           'UPDATE customers SET erp_contact_id=$2 WHERE id=$1 AND (erp_contact_id IS NULL OR erp_contact_id=$2) RETURNING id',
           [job.customer_id, String(result.contactId)],
         );
         if (!changed.rowCount) throw new ConflictException('Связь контакта изменилась');
+        const identities = newer
+          ? (
+              await db.query<{ kind: 'phone' | 'email'; value: string }>(
+                "SELECT DISTINCT kind,value FROM customer_identities WHERE customer_id=$1 AND kind IN ('phone','email')",
+                [newer.id],
+              )
+            ).rows
+          : profile.identities;
+        const contacts = newer?.contacts ?? profile;
+        await db.query(
+          `UPDATE customers SET contacts=contacts || jsonb_build_object('phone',$2::text,'email',$3::text),
+           erp_contact_updated_at=$4 WHERE erp_contact_id=$1`,
+          [
+            String(result.contactId),
+            contacts.phone,
+            contacts.email,
+            newer?.erp_contact_updated_at ?? result.contact.updatedAt,
+          ],
+        );
+        await db.query(
+          `DELETE FROM customer_identities i USING customers c
+           WHERE i.customer_id=c.id AND c.erp_contact_id=$1 AND i.kind IN ('phone','email')`,
+          [String(result.contactId)],
+        );
+        for (const identity of identities) {
+          await db.query(
+            `INSERT INTO customer_identities(id,customer_id,site_id,kind,value,verified)
+             SELECT gen_random_uuid(),id,NULL,$2,$3,false FROM customers WHERE erp_contact_id=$1`,
+            [String(result.contactId), identity.kind, identity.value],
+          );
+        }
         await db.query(
           "UPDATE erp_sync_operations SET state='completed',erp_contact_id=$2,last_error=NULL,locked_until=NULL,updated_at=now() WHERE id=$1",
           [job.id, String(result.contactId)],
