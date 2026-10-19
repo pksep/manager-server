@@ -7,6 +7,7 @@ import { Database } from './database';
 import { ChatAdapter } from './chat-adapter';
 import { InquiriesService } from './inquiries.service';
 import { DeliveryWorker } from './delivery.worker';
+import { ManagerAssignmentsWorker } from './manager-assignments.worker';
 import { GuestGuard, HealthController, SafeErrorFilter, WidgetController } from './http';
 import { attachWidgetEvents } from './widget-events';
 import { StaffController, StaffGuard } from './staff';
@@ -64,6 +65,7 @@ export async function createApplication(
       ChatAdapter,
       InquiriesService,
       DeliveryWorker,
+      ManagerAssignmentsWorker,
       GuestGuard,
       StaffGuard,
       ErpSyncService,
@@ -147,6 +149,7 @@ export async function createApplication(
       // Обработчики завершают сохранение результата, пока база ещё открыта.
       await app.get(OperationQueue).onModuleDestroy();
       await app.get(DeliveryWorker).onModuleDestroy();
+      await app.get(ManagerAssignmentsWorker).onModuleDestroy();
       await app.get(RetentionWorker).onModuleDestroy();
       await app.close();
     },
