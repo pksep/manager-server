@@ -13,6 +13,7 @@ const files = [
   '007_visitor_limits.sql',
   '008_channels.sql',
   '009_support_clients.sql',
+  '010_telegram_max.sql',
 ];
 
 export interface MigrationStatus {

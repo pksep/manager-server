@@ -1,4 +1,13 @@
-import { Body, Controller, HttpCode, Inject, Param, Post, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Headers,
+  HttpCode,
+  Inject,
+  Param,
+  Post,
+  Res,
+} from '@nestjs/common';
 import type { Response } from 'express';
 import { z } from 'zod';
 import { ChannelService } from './service';
@@ -30,6 +39,40 @@ export class ChannelController {
   ): Promise<{ ok: true }> {
     const connection = this.channels.connection('avito', id, secret);
     await this.channels.receive(connection, body);
+    return { ok: true };
+  }
+
+  @Post('telegram/:id')
+  @HttpCode(200)
+  async telegram(
+    @Param('id') id: string,
+    @Headers('x-telegram-bot-api-secret-token') secret: string | undefined,
+    @Body() body: unknown,
+  ): Promise<{ ok: true }> {
+    const connection = this.channels.connection(
+      'telegram',
+      id,
+      typeof secret === 'string' ? secret : '',
+    );
+    await this.channels.receive(connection, body);
+
+    return { ok: true };
+  }
+
+  @Post('max/:id')
+  @HttpCode(200)
+  async max(
+    @Param('id') id: string,
+    @Headers('x-max-bot-api-secret') secret: string | undefined,
+    @Body() body: unknown,
+  ): Promise<{ ok: true }> {
+    const connection = this.channels.connection(
+      'max',
+      id,
+      typeof secret === 'string' ? secret : '',
+    );
+    await this.channels.receive(connection, body);
+
     return { ok: true };
   }
 }
