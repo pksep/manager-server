@@ -12,7 +12,7 @@ writeFileSync(
     `DATABASE_URL=postgres://manager_local:${password}@127.0.0.1:56441/manager_local`,
     `LOCAL_POSTGRES_PASSWORD=${password}`,
     'REDIS_URL=redis://127.0.0.1:56394/14',
-    `MANAGER_RABBITMQ_URL=amqp://manager-local:${password}@127.0.0.1:55675/manager-service`,
+    `MANAGER_RABBITMQ_URL=amqp://manager-local:${password}@127.0.0.1:45675/manager-service`,
     'MANAGER_CAPTCHA_MODE=disabled',
     'MANAGER_SCAN_MODE=required',
     `LOCAL_MINIO_PASSWORD=${secret()}`,

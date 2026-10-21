@@ -83,12 +83,18 @@ export type Site = z.infer<typeof SiteSchema>;
 export type WidgetConfig = z.infer<typeof WidgetConfigSchema>;
 export const ContactsSchema = z
   .object({
-    name: z.string().trim().min(2).max(100),
-    phone: z.string().trim().max(40),
-    email: z.string().trim().max(254),
+    name: z.string().trim().max(100).default(''),
+    phone: z.string().trim().max(40).default(''),
+    email: z.string().trim().max(254).default(''),
   })
   .strict();
 export type Contacts = z.infer<typeof ContactsSchema>;
+
+/** Пустое имя не блокирует доставку и не выдаётся за введённое посетителем. */
+export function customerDisplayName(contacts: Contacts): string {
+  return contacts.name.trim() || 'Посетитель сайта';
+}
+
 export const SourceSchema = z.object({
   pageUrl: safeUrl,
   title: z.string().max(200),

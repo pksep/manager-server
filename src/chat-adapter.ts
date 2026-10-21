@@ -14,6 +14,7 @@ import {
   ChatEventSchema,
   ChatReceiptSchema,
   OperatorTypingSchema,
+  customerDisplayName,
   type OperatorTyping,
   type Contacts,
 } from './contracts';
@@ -27,6 +28,16 @@ export class ChatRequestFailed extends ServiceUnavailableException {
 
 @Injectable()
 export class ChatAdapter {
+  /** Получает полный текущий список сотрудников с правом работы с клиентами. */
+  async managerIds(): Promise<string[]> {
+    const snapshot = z
+      .object({ userIds: z.array(z.uuid()).max(100000) })
+      .strict()
+      .parse(await (await this.request('/managers')).json());
+
+    return snapshot.userIds;
+  }
+
   /** Читает временное начало набора только для конкретной гостевой сессии. */
   async typing(
     inquiryId: string,
@@ -145,7 +156,7 @@ export class ChatAdapter {
             operationId: message.id,
             guestSessionId: inquiry.session_id,
             customerId: inquiry.customer_id,
-            customerName: inquiry.contacts.name,
+            customerName: customerDisplayName(inquiry.contacts),
             source: inquiry.source,
             html: message.html,
             attachmentIds: message.attachmentIds,

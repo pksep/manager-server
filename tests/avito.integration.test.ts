@@ -21,8 +21,9 @@ const password = randomUUID();
 const containers: string[] = [];
 const packetSchema = z.object({
   operationId: z.uuid(),
+  customerName: z.string().min(1).max(100),
   html: z.string(),
-  source: z.object({ channel: z.literal('avito') }).passthrough(),
+  source: z.object({ channel: z.enum(['avito', 'widget']) }).passthrough(),
 });
 const packets = new Map<string, z.infer<typeof packetSchema>>();
 const receipts = new Map<
@@ -397,4 +398,114 @@ test('повреждённая страница не создаёт обраще
     ).rowCount,
   ).toBe(0);
   expect(packets.size).toBe(1);
+});
+
+test('виджет принимает телефон или email без имени и доставляет непустой профиль в Чат', async (): Promise<void> => {
+  const origin = 'http://127.0.0.1:4310';
+
+  for (const contacts of [
+    { phone: '+7 (999) 123-45-67' },
+    { email: 'Visitor+sales@Example.Test' },
+  ]) {
+    const sessionResponse = await fetch(`${base}/v1/widget/session`, {
+      method: 'POST',
+      headers: { Origin: origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        siteId: 'amotiv-demo',
+        source: {
+          pageUrl: origin + '/contact-test',
+          title: 'Проверка контактов',
+          referrerOrigin: '',
+        },
+      }),
+    });
+    expect(sessionResponse.status).toBe(201);
+    const session = z.object({ token: z.string() }).parse(await sessionResponse.json());
+    const response = await fetch(`${base}/v1/widget/inquiries`, {
+      method: 'POST',
+      headers: {
+        Origin: origin,
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${session.token}`,
+      },
+      body: JSON.stringify({
+        operationId: randomUUID(),
+        html: '<p>Нужна помощь</p>',
+        attachmentIds: [],
+        contacts,
+      }),
+    });
+    expect(response.status).toBe(201);
+    const result = z
+      .object({ inquiryId: z.uuid(), message: z.object({ id: z.uuid() }) })
+      .parse(await response.json());
+    const packet = await until(
+      async (): Promise<z.infer<typeof packetSchema> | undefined> =>
+        packets.get(result.message.id),
+      (value) => !!value,
+    );
+    expect(packet?.customerName).toBe('Посетитель сайта');
+    expect(packet?.source.channel).toBe('widget');
+    const customer = (
+      await database!.query<{
+        name: string;
+        contacts: { name: string; phone: string; email: string };
+      }>(
+        'SELECT c.name,c.contacts FROM customers c JOIN inquiries i ON i.customer_id=c.id WHERE i.id=$1',
+        [result.inquiryId],
+      )
+    ).rows[0];
+    expect(customer.name).toBe('Посетитель сайта');
+    expect(customer.contacts.name).toBe('');
+    expect(customer.contacts).toMatchObject(
+      'phone' in contacts
+        ? { phone: contacts.phone, email: '' }
+        : { phone: '', email: contacts.email },
+    );
+  }
+});
+
+test('пустое и неверное средство связи не создаёт обращение, а старая форма продолжает работать', async (): Promise<void> => {
+  const origin = 'http://127.0.0.1:4310';
+  const headers = { Origin: origin, 'Content-Type': 'application/json' };
+  const sessionResponse = await fetch(`${base}/v1/widget/session`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      siteId: 'amotiv-demo',
+      source: { pageUrl: origin + '/validation-test', title: '', referrerOrigin: '' },
+    }),
+  });
+  const session = z.object({ token: z.string() }).parse(await sessionResponse.json());
+  const before = (
+    await database!.query<{ count: string }>('SELECT count(*) FROM inquiries')
+  ).rows[0].count;
+  for (const contacts of [{}, { phone: '123' }, { email: 'wrong@' }]) {
+    const response = await fetch(`${base}/v1/widget/inquiries`, {
+      method: 'POST',
+      headers: { ...headers, Authorization: `Bearer ${session.token}` },
+      body: JSON.stringify({
+        operationId: randomUUID(),
+        html: 'Проверка',
+        attachmentIds: [],
+        contacts,
+      }),
+    });
+    expect(response.status).toBe(400);
+  }
+  expect(
+    (await database!.query<{ count: string }>('SELECT count(*) FROM inquiries')).rows[0]
+      .count,
+  ).toBe(before);
+  const response = await fetch(`${base}/v1/widget/inquiries`, {
+    method: 'POST',
+    headers: { ...headers, Authorization: `Bearer ${session.token}` },
+    body: JSON.stringify({
+      operationId: randomUUID(),
+      html: 'Старая форма',
+      attachmentIds: [],
+      contacts: { name: 'Иван', phone: '+79991234567', email: 'legacy@example.test' },
+    }),
+  });
+  expect(response.status).toBe(201);
 });

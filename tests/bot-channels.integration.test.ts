@@ -486,10 +486,14 @@ test('личные сообщения и фото обоих ботов дохо
   ).not.toContain('test-token');
   let rollbackRefused = false;
 
+  // Проверяем откат именно миграции ботов, а не последующего обновления контактов.
+  await database!.migrate('down');
   try {
     await database!.migrate('down');
   } catch {
     rollbackRefused = true;
+  } finally {
+    await database!.migrate();
   }
 
   expect(rollbackRefused).toBe(true);

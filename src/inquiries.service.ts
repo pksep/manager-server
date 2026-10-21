@@ -639,6 +639,22 @@ export class InquiriesService implements OnModuleInit {
   /** Применяет события строго по порядку чата; чужие ответы не меняют ответственного. */
   async acceptEvents(inquiryId: string, events: ChatEvent[]) {
     if (!events.length) return;
+
+    const eligibleStaffIds = new Set<string>();
+    const senders = new Set(
+      events
+        .filter((event) => event.type === 'message' && event.direction === 'incoming')
+        .map((event) => event.senderId),
+    );
+    for (const senderId of senders) {
+      try {
+        await this.chat.assertManager(senderId);
+        eligibleStaffIds.add(senderId);
+      } catch (error) {
+        if (!(error instanceof ForbiddenException)) throw error;
+      }
+    }
+
     const outgoing: string[] = [];
     await this.database.transaction(async (client) => {
       const header = (
@@ -721,15 +737,17 @@ export class InquiriesService implements OnModuleInit {
               sessionId,
             ],
           );
-          const assigned = await client.query(
-            'UPDATE inquiries SET assignee_id=$2,manager_ids=ARRAY[$2::uuid],metadata_version=metadata_version+1 WHERE id=$1 AND assignee_id IS NULL AND NOT manually_assigned RETURNING id',
-            [inquiryId, event.senderId],
-          );
-          if (assigned.rowCount)
-            await client.query(
-              "INSERT INTO assignment_events(id,inquiry_id,user_id,reason) VALUES($1,$2,$3,'first_reply')",
-              [randomUUID(), inquiryId, event.senderId],
+          if (eligibleStaffIds.has(event.senderId)) {
+            const assigned = await client.query(
+              'UPDATE inquiries SET assignee_id=$2,manager_ids=ARRAY[$2::uuid],metadata_version=metadata_version+1 WHERE id=$1 AND assignee_id IS NULL AND NOT manually_assigned RETURNING id',
+              [inquiryId, event.senderId],
             );
+            if (assigned.rowCount)
+              await client.query(
+                "INSERT INTO assignment_events(id,inquiry_id,user_id,reason) VALUES($1,$2,$3,'first_reply')",
+                [randomUUID(), inquiryId, event.senderId],
+              );
+          }
           await client.query(
             "INSERT INTO channel_outbox(id,inquiry_id,route_id) SELECT $1,$2,$3 WHERE EXISTS(SELECT 1 FROM reply_routes WHERE id=$3 AND channel<>'widget') ON CONFLICT(id) DO NOTHING",
             [messageId, inquiryId, sessionId],
