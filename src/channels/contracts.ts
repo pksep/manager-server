@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { Attachment, Contacts } from '../contracts';
 
-export const PlatformSchema = z.enum(['vk', 'avito', 'telegram', 'max']);
+export const PlatformSchema = z.enum(['vk', 'avito', 'telegram', 'max', 'whatsapp']);
 
 export type Platform = z.infer<typeof PlatformSchema>;
 
@@ -24,6 +24,7 @@ export interface ReplyRoute {
   external_user_id: string | null;
   source: Record<string, unknown>;
   last_inbound_at: Date;
+  provider_inbound_at?: Date | null;
 }
 
 export interface IncomingFile {
@@ -83,6 +84,24 @@ const documentMimeTypes = [
 ];
 
 export const capabilities: Record<'widget' | Platform, ChannelCapabilities> = {
+  whatsapp: {
+    textChars: 4096,
+    fileBytes: 20 * 1024 * 1024,
+    fileCount: 10,
+    mimeTypes: [
+      'image/jpeg',
+      'image/png',
+      'application/pdf',
+      'text/plain',
+      'application/msword',
+      'application/vnd.ms-excel',
+      'application/vnd.ms-powerpoint',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    ],
+    readReceipts: false,
+  },
   widget: {
     textChars: 10000,
     fileBytes: 20 * 1024 * 1024,

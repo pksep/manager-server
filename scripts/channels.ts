@@ -6,6 +6,7 @@ import { VkAdapter } from '../src/channels/vk';
 import { AvitoAdapter } from '../src/channels/avito';
 import { TelegramAdapter } from '../src/channels/telegram';
 import { MaxAdapter } from '../src/channels/max';
+import { WhatsAppAdapter } from '../src/channels/whatsapp';
 import { ChannelError } from '../src/channels/contracts';
 import { Database } from '../src/database';
 import { z } from 'zod';
@@ -17,6 +18,7 @@ const vk = new VkAdapter(http, files);
 const avito = new AvitoAdapter(http, files);
 const telegram = new TelegramAdapter(http, files);
 const max = new MaxAdapter(http, files);
+const whatsapp = new WhatsAppAdapter(http, files);
 const [command, connectionId, operationId] = process.argv.slice(2);
 const selected = config.channels.filter(
   (item) => item.enabled && (!connectionId || item.id === connectionId),
@@ -65,6 +67,7 @@ try {
           });
         else if (connection.platform === 'telegram') await telegram.check(connection);
         else if (connection.platform === 'max') await max.check(connection);
+        else if (connection.platform === 'whatsapp') await whatsapp.check(connection);
         else {
           const account = z
             .object({ id: z.number().int().positive() })
@@ -88,7 +91,12 @@ try {
           origin.hash
         )
           throw new Error('MANAGER_PUBLIC_URL должен быть HTTPS origin без пути');
-        if (connection.platform === 'avito') {
+        if (connection.platform === 'whatsapp') {
+          await whatsapp.subscribe(connection);
+          console.info(
+            `${connection.id}: приложение подписано на аккаунт WhatsApp. В кабинете Meta настройте callback ${origin.origin}/v1/channels/whatsapp/${connection.id}, поле messages и Verify Token из серверного окружения`,
+          );
+        } else if (connection.platform === 'avito') {
           await avito.call(connection, '/messenger/v3/webhook', {
             url: `${origin.origin}/v1/channels/avito/${connection.id}/${connection.webhookSecret}`,
           });

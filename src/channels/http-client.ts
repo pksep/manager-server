@@ -112,6 +112,10 @@ export function assertPlatformUrl(
     avito: { api: 'api.avito.ru', files: ['avito.ru', 'avito.st', 'avito.com'] },
     telegram: { api: 'api.telegram.org', files: ['api.telegram.org'] },
     max: { api: 'platform-api2.max.ru', files: ['max.ru', 'oneme.ru'] },
+    whatsapp: {
+      api: 'graph.facebook.com',
+      files: ['graph.facebook.com', 'lookaside.fbsbx.com'],
+    },
   };
   const allowed = hosts[platform];
   if (

@@ -1,5 +1,17 @@
 [
   {
+    "id": "whatsapp-company",
+    "platform": "whatsapp",
+    "name": "Компания в WhatsApp",
+    "accountId": "12345678901234567",
+    "businessAccountId": "12345678901234568",
+    "apiVersion": "v25.0",
+    "enabled": false,
+    "tokenEnv": "MANAGER_WHATSAPP_TOKEN",
+    "appSecretEnv": "MANAGER_WHATSAPP_APP_SECRET",
+    "webhookSecretEnv": "MANAGER_WHATSAPP_VERIFY_TOKEN"
+  },
+  {
     "id": "vk-company",
     "platform": "vk",
     "name": "Компания ВКонтакте",
