@@ -31,6 +31,7 @@ import { VkAdapter } from './channels/vk';
 import { AvitoAdapter } from './channels/avito';
 import { TelegramAdapter } from './channels/telegram';
 import { MaxAdapter } from './channels/max';
+import { WhatsAppAdapter } from './channels/whatsapp';
 import { SupportController, SupportService } from './support';
 
 export async function createApplication(
@@ -57,6 +58,7 @@ export async function createApplication(
       AvitoAdapter,
       TelegramAdapter,
       MaxAdapter,
+      WhatsAppAdapter,
       ChannelService,
       Database,
       OperationQueue,
@@ -79,6 +81,7 @@ export async function createApplication(
   const app = await NestFactory.create<NestExpressApplication>(ManagerModule, {
     logger: ['error', 'warn'],
     bodyParser: false,
+    rawBody: true,
   });
   const origins = new Set(
     config.sites.filter((site) => site.enabled).flatMap((site) => site.widgetOrigins),
