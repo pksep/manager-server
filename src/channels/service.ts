@@ -31,6 +31,8 @@ import { AvitoAdapter, AvitoWebhookSchema } from './avito';
 import { ChannelFiles } from './files';
 import { TelegramAdapter, TelegramUpdateSchema } from './telegram';
 import { MaxAdapter, MaxUpdateSchema, type MaxUpload } from './max';
+import { WhatsAppAdapter, WhatsAppValueSchema, whatsAppEvents } from './whatsapp';
+import { verifyWhatsAppSignature } from './whatsapp-signature';
 
 interface Job {
   id: string;
@@ -98,6 +100,7 @@ export class ChannelService implements OnModuleInit {
     @Inject(AvitoAdapter) private readonly avito: AvitoAdapter,
     @Inject(TelegramAdapter) private readonly telegram: TelegramAdapter,
     @Inject(MaxAdapter) private readonly max: MaxAdapter,
+    @Inject(WhatsAppAdapter) private readonly whatsapp: WhatsAppAdapter,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -158,6 +161,15 @@ export class ChannelService implements OnModuleInit {
 
   /** Подтверждает приём только после сохранения события и намерения доставки. */
   async receive(connection: ChannelConnection, body: unknown): Promise<string> {
+    if (
+      connection.platform === 'whatsapp' &&
+      !WhatsAppValueSchema.safeParse(body).success
+    ) {
+      for (const event of whatsAppEvents(connection, body))
+        await this.receive(connection, event);
+
+      return 'ok';
+    }
     let payload: unknown;
     let eventKey: string;
     if (connection.platform === 'vk') {
@@ -191,9 +203,11 @@ export class ChannelService implements OnModuleInit {
       payload = event;
     } else {
       payload =
-        connection.platform === 'telegram'
-          ? TelegramUpdateSchema.parse(body)
-          : MaxUpdateSchema.parse(body);
+        connection.platform === 'whatsapp'
+          ? WhatsAppValueSchema.parse(body)
+          : connection.platform === 'telegram'
+            ? TelegramUpdateSchema.parse(body)
+            : MaxUpdateSchema.parse(body);
       const message = await this.incoming(connection, payload);
 
       if (!message) return 'ok';
@@ -353,6 +367,8 @@ export class ChannelService implements OnModuleInit {
         return this.telegram.incoming(connection, payload);
       case 'max':
         return this.max.incoming(connection, payload);
+      case 'whatsapp':
+        return this.whatsapp.incoming(connection, payload);
     }
   }
 
@@ -396,9 +412,11 @@ export class ChannelService implements OnModuleInit {
             upload,
           );
         const attachment =
-          connection.platform === 'telegram'
-            ? await this.telegram.receive(connection, file, use)
-            : await this.files.receive(connection.platform, file, use);
+          connection.platform === 'whatsapp'
+            ? await this.whatsapp.receive(connection, file, use)
+            : connection.platform === 'telegram'
+              ? await this.telegram.receive(connection, file, use)
+              : await this.files.receive(connection.platform, file, use);
         attachments.push(attachment.id);
       } catch (error) {
         if (
@@ -447,15 +465,19 @@ export class ChannelService implements OnModuleInit {
       if (current) {
         if (current.external_user_id !== message.userId)
           throw new ChannelError('CHANNEL_PARTICIPANT_CHANGED');
-        await transaction.query('UPDATE reply_routes SET source=$2 WHERE id=$1', [
-          current.id,
-          message.source,
-        ]);
+        await transaction.query(
+          'UPDATE reply_routes SET source=$2,provider_inbound_at=GREATEST(provider_inbound_at,$3::timestamptz) WHERE id=$1',
+          [
+            current.id,
+            message.source,
+            connection.platform === 'whatsapp' ? message.createdAt : null,
+          ],
+        );
         return { ...current, source: { ...message.source } };
       }
       return (
         await transaction.query<ReplyRoute>(
-          'INSERT INTO reply_routes(id,channel,connection_id,external_chat_id,external_user_id,source) VALUES($1,$2,$3,$4,$5,$6) RETURNING *',
+          'INSERT INTO reply_routes(id,channel,connection_id,external_chat_id,external_user_id,source,provider_inbound_at) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',
           [
             randomUUID(),
             connection.platform,
@@ -463,6 +485,7 @@ export class ChannelService implements OnModuleInit {
             message.conversationId,
             message.userId,
             message.source,
+            connection.platform === 'whatsapp' ? message.createdAt : null,
           ],
         )
       ).rows[0];
@@ -478,6 +501,7 @@ export class ChannelService implements OnModuleInit {
     if (!route?.connection_id || !route.external_chat_id)
       throw new ChannelError('CHANNEL_ROUTE_NOT_FOUND');
     const connection = this.configured(route.connection_id);
+    this.assertWhatsAppWindow(connection, route, false);
     if (
       connection.platform !== 'vk' &&
       job.sending_part !== null &&
@@ -515,6 +539,13 @@ export class ChannelService implements OnModuleInit {
       const part = parts[index];
       let sending = false;
       const beginSend = async (): Promise<void> => {
+        if (connection.platform === 'whatsapp') {
+          const current = await this.db.query<ReplyRoute>(
+            'SELECT * FROM reply_routes WHERE id=$1',
+            [route.id],
+          );
+          this.assertWhatsAppWindow(connection, current.rows[0] || route, false);
+        }
         if (connection.platform === 'max' || connection.platform === 'telegram') {
           await this.security
             .consume([
@@ -642,6 +673,8 @@ export class ChannelService implements OnModuleInit {
           );
         case 'telegram':
           return this.telegram.send(connection, chatId, text);
+        case 'whatsapp':
+          return this.whatsapp.send(connection, chatId, text);
         case 'max':
           return this.max.send(
             connection,
@@ -679,6 +712,16 @@ export class ChannelService implements OnModuleInit {
             return send(await this.avito.upload(connection, upload));
           case 'max':
             return send(await this.max.upload(connection, upload));
+          case 'whatsapp': {
+            const id = await this.whatsapp.upload(connection, upload);
+            await beginSend();
+
+            return this.whatsapp.send(connection, chatId, '', {
+              id,
+              mime: part.file.mime,
+              name: part.file.name,
+            });
+          }
         }
       },
       part.file.size,
@@ -701,9 +744,18 @@ export class ChannelService implements OnModuleInit {
       pageUrl: route.source.pageUrl,
       canReply:
         route.enabled &&
+        (route.channel !== 'whatsapp' ||
+          (!!route.provider_inbound_at &&
+            new Date(route.provider_inbound_at).getTime() > Date.now() - 86400000)) &&
         (route.channel !== 'widget' ||
           route.support_active ||
           (!!route.expires_at && route.expires_at > new Date())),
+      replyUnavailableReason:
+        route.channel === 'whatsapp' &&
+        (!route.provider_inbound_at ||
+          new Date(route.provider_inbound_at).getTime() <= Date.now() - 86400000)
+          ? 'Окно ответа WhatsApp истекло. Дождитесь нового сообщения клиента'
+          : undefined,
       capabilities: capabilities[route.channel],
     }));
   }
@@ -720,7 +772,8 @@ export class ChannelService implements OnModuleInit {
       )
     ).rows[0];
     if (!route) throw new NotFoundException('Канал не принадлежит обращению');
-    if (route.connection_id) this.configured(route.connection_id);
+    if (route.connection_id)
+      this.assertWhatsAppWindow(this.configured(route.connection_id), route);
     else if (
       !(
         await this.db.query(
@@ -731,6 +784,47 @@ export class ChannelService implements OnModuleInit {
     )
       throw new ConflictException('Посетитель завершил сессию. Выберите другой канал');
     return { id: route.id, source: route.source };
+  }
+
+  private assertWhatsAppWindow(
+    connection: ChannelConnection,
+    route: ReplyRoute,
+    userFacing = true,
+  ): void {
+    if (connection.platform !== 'whatsapp') return;
+
+    const timestamp = route.provider_inbound_at
+      ? new Date(route.provider_inbound_at).getTime()
+      : 0;
+    if (
+      !timestamp ||
+      !Number.isFinite(timestamp) ||
+      Date.now() - timestamp >= 24 * 60 * 60 * 1000
+    ) {
+      if (!userFacing) throw new ChannelError('WHATSAPP_WINDOW_EXPIRED');
+
+      throw new ConflictException(
+        'Окно ответа WhatsApp истекло. Дождитесь нового сообщения клиента. Отправка шаблонов пока не подключена',
+      );
+    }
+  }
+
+  whatsappConnection(
+    id: string,
+    rawBody: Uint8Array | undefined,
+    signature: string | undefined,
+  ): ChannelConnection {
+    const connection = this.config.channels.find(
+      (item) => item.id === id && item.platform === 'whatsapp' && item.enabled,
+    );
+    if (
+      !connection ||
+      !rawBody ||
+      !verifyWhatsAppSignature(rawBody, signature, connection.appSecret || '')
+    )
+      throw new ForbiddenException('Подключение не авторизовано');
+
+    return connection;
   }
 
   /** Повтор неопределённой отправки требует явного подтверждения после проверки переписки. */

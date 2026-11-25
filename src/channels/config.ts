@@ -29,6 +29,14 @@ const schema = z.discriminatedUnion('platform', [
     platform: z.literal('max'),
     tokenEnv: environmentKey,
   }),
+  base.extend({
+    platform: z.literal('whatsapp'),
+    accountId: z.string().regex(/^[1-9][0-9]{0,31}$/),
+    businessAccountId: z.string().regex(/^[1-9][0-9]{0,31}$/),
+    apiVersion: z.string().regex(/^v[0-9]{2,3}\.0$/),
+    tokenEnv: environmentKey,
+    appSecretEnv: environmentKey,
+  }),
 ]);
 
 export type ChannelConnection = z.infer<typeof schema> & {
@@ -37,6 +45,7 @@ export type ChannelConnection = z.infer<typeof schema> & {
   confirmation?: string;
   clientId?: string;
   clientSecret?: string;
+  appSecret?: string;
 };
 
 /** Конфигурация содержит ссылки на переменные окружения; реальные ключи остаются на сервере. */
@@ -79,6 +88,9 @@ export function readChannels(
     return {
       ...connection,
       webhookSecret,
+      ...(connection.platform === 'whatsapp'
+        ? { appSecret: credential(connection.appSecretEnv, 16) }
+        : {}),
       ...(connection.platform === 'avito'
         ? {
             clientId: credential(connection.clientIdEnv),

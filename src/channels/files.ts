@@ -138,11 +138,21 @@ export class ChannelFiles {
     field: string,
     file: Express.Multer.File,
     headers: Record<string, string> = {},
+    fields: Record<string, string> = {},
   ): Promise<unknown> {
     const boundary = `manager-${randomBytes(18).toString('hex')}`;
     const filename = file.originalname.replace(/["\r\n\\]/g, '_');
+    const extra = Object.entries(fields)
+      .map(([key, value]): string => {
+        if (!/^[a-z_]+$/.test(key) || /[\r\n]/.test(value))
+          throw new ChannelError('CHANNEL_UPLOAD_FIELD_INVALID');
+
+        return `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`;
+      })
+      .join('');
     const prefix = Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${filename}"\r\nContent-Type: ${file.mimetype}\r\n\r\n`,
+      extra +
+        `--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${filename}"\r\nContent-Type: ${file.mimetype}\r\n\r\n`,
     );
     const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
     const source = createReadStream(file.path);

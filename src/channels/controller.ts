@@ -1,5 +1,8 @@
 import {
   Body,
+  Get,
+  Query,
+  Req,
   Controller,
   Headers,
   HttpCode,
@@ -8,13 +11,45 @@ import {
   Post,
   Res,
 } from '@nestjs/common';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
+import type { RawBodyRequest } from '@nestjs/common';
 import { z } from 'zod';
 import { ChannelService } from './service';
 
 @Controller('v1/channels')
 export class ChannelController {
   constructor(@Inject(ChannelService) private readonly channels: ChannelService) {}
+
+  @Get('whatsapp/:id')
+  verifyWhatsApp(
+    @Param('id') id: string,
+    @Query() query: unknown,
+    @Res() response: Response,
+  ): void {
+    const values = z
+      .object({
+        'hub.mode': z.literal('subscribe'),
+        'hub.verify_token': z.string().max(128),
+        'hub.challenge': z.string().regex(/^[0-9]{1,100}$/),
+      })
+      .parse(query);
+    this.channels.connection('whatsapp', id, values['hub.verify_token']);
+    response.type('text/plain').send(values['hub.challenge']);
+  }
+
+  @Post('whatsapp/:id')
+  @HttpCode(200)
+  async whatsapp(
+    @Param('id') id: string,
+    @Req() request: RawBodyRequest<Request>,
+    @Headers('x-hub-signature-256') signature: string | undefined,
+    @Body() body: unknown,
+  ): Promise<{ ok: true }> {
+    const connection = this.channels.whatsappConnection(id, request.rawBody, signature);
+    await this.channels.receive(connection, body);
+
+    return { ok: true };
+  }
 
   /** ВК требует текст confirmation при подключении и ровно ok для остальных событий. */
   @Post('vk/:id')

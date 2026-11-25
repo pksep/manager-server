@@ -15,6 +15,8 @@ const files = [
   '009_support_clients.sql',
   '010_telegram_max.sql',
   '011_erp_contact_refresh.sql',
+  '012_whatsapp.sql',
+  '013_widget_site_settings.sql',
 ];
 
 export interface MigrationStatus {

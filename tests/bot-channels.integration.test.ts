@@ -488,6 +488,7 @@ test('личные сообщения и фото обоих ботов дохо
 
   // Проверяем откат именно миграции ботов, а не последующего обновления контактов.
   await database!.migrate('down');
+  await database!.migrate('down');
   try {
     await database!.migrate('down');
   } catch {
