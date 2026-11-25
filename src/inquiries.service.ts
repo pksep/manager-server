@@ -91,7 +91,7 @@ export class InquiriesService implements OnModuleInit {
   ) {}
   async onModuleInit() {
     const version = await this.database.query(
-      'SELECT version FROM manager_schema_migrations WHERE version=9',
+      'SELECT version FROM manager_schema_migrations WHERE version=13',
     );
     if (!version.rowCount) throw new Error('Сначала примените миграции manager');
     for (const site of this.config.sites)
@@ -191,7 +191,7 @@ export class InquiriesService implements OnModuleInit {
     return {
       token,
       visitorToken,
-      config: this.settings.publicConfig(site.config),
+      config: await this.settings.forSite(site),
       serverTime: new Date().toISOString(),
       ...(await this.snapshot(guest)),
     };

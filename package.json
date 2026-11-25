@@ -25,6 +25,7 @@
     "test:avito": "bun run build && bun test tests/avito.integration.test.ts --timeout 90000",
     "test:bots": "bun run build && bun test tests/bot-channels.integration.test.ts --timeout 90000",
     "test:whatsapp": "bun run build && bun test tests/whatsapp.integration.test.ts --timeout 90000",
+    "test:widget-settings": "bun run build && bun test tests/widget-site-settings.integration.test.ts --timeout 30000",
     "channels:check": "bun scripts/channels.ts check",
     "channels:subscribe": "bun scripts/channels.ts subscribe",
     "channels:status": "bun scripts/channels.ts status",

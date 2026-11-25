@@ -35,7 +35,7 @@ export const WidgetConfigSchema = z.object({
       z.object({
         label: z.string().max(80),
         url: safeUrl,
-        icon: z.enum(['vk', 'telegram', 'chat']),
+        icon: z.enum(['vk', 'avito', 'telegram', 'max', 'chat']),
       }),
     )
     .max(6),
@@ -52,6 +52,9 @@ export const WidgetConfigSchema = z.object({
     end: time,
     days: z.array(z.number().int().min(0).max(6)),
   }),
+  managedByChat: z.literal(true).optional(),
+  initialMessage: z.string().max(2000).optional(),
+  autoOpenDelayMs: z.number().int().min(0).max(3600000).nullable().optional(),
   contactPolicy: z.enum(['all', 'name-and-one']),
   limits: z.object({
     fileBytes: z

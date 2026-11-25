@@ -24,6 +24,7 @@ import { InquiriesService } from './inquiries.service';
 import type { Request } from 'express';
 import { ErpSyncService } from './erp-sync.service';
 import { ChannelService } from './channels/service';
+import { WidgetSettings } from './widget-settings';
 
 type StaffRequest = Request & { actorId: string };
 @Injectable()
@@ -53,7 +54,27 @@ export class StaffController {
     @Inject(InquiriesService) private readonly inquiries: InquiriesService,
     @Inject(ErpSyncService) private readonly erp: ErpSyncService,
     @Inject(ChannelService) private readonly channels: ChannelService,
+    @Inject(WidgetSettings) private readonly widget: WidgetSettings,
   ) {}
+
+  @Get('widget-sites')
+  widgetSites(): ReturnType<WidgetSettings['sites']> {
+    return this.widget.sites();
+  }
+
+  @Get('widget-sites/:siteId')
+  widgetSite(@Param('siteId') siteId: string): ReturnType<WidgetSettings['edit']> {
+    return this.widget.edit(siteId);
+  }
+
+  @Post('widget-sites/:siteId')
+  saveWidgetSite(
+    @Param('siteId') siteId: string,
+    @Body() body: unknown,
+    @Req() request: StaffRequest,
+  ): ReturnType<WidgetSettings['save']> {
+    return this.widget.save(siteId, body, request.actorId);
+  }
 
   /** Доступные адресаты ответа не содержат секретов подключений. */
   @Get('inquiries/:id/routes')
